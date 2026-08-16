@@ -1,0 +1,4 @@
+interface:
+  display_name: "Chan Interactive Audit Report"
+  short_description: "Interactive daily and 30-minute Chan evidence report"
+  default_prompt: "Use $render-chan-interactive-report to generate a standalone interactive HTML audit report for a stock trade."
