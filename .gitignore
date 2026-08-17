@@ -8,3 +8,8 @@ tmp/
 .env
 .venv/
 venv/
+# 回测中间产物与图表资源不入库; 标的清单(可复现)与审计报告例外
+results/*
+!results/*_symbols*.json
+!results/审计报告_*.md
+charts/

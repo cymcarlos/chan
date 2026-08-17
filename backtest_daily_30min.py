@@ -31,6 +31,36 @@ from chan.daily_scan import scan_daily, scan_daily_on_bis, scan_daily_on_bars, l
 USE_30M_SWING = False   # A/B: 关(干净口径对照)
                        # (原False: 全仓清仓式短差破坏趋势股; 现保留pnl>3%+60根门限+回补机制,
                        #  验证"先浮盈后亏"单能否被30min一卖/二卖救出, 以及回补是否对冲卖飞)
+# 出场规则开关(2026-08-17 随机200只×3年回测驱动, 可用环境变量做A/B回归):
+#   CHAN_EXIT_CONSOL: 'high'(默认) = 21课本义"高点区域+走弱确认才卖, 回撤10%兜底"
+#                     'retrace'   = 旧版"持仓>40根后峰值回落5%即卖"(杀趋势赢家, 见ALGORITHM.md §7.18)
+#                     'off'       = 关闭④-5: 三买按趋势单管理(走日K一卖/三卖/结构止损),
+#                                  盘整高点规则仅留给未来的盘整买点玩法(21课适用前提)
+#   CHAN_EXIT_ZG: 结构止损系数, 默认0.99 — F2(2026-08-17)破位判定对齐日K收盘后,
+#     噪声缓冲只需1%(与入口侧0.99分型带对称); 旧0.97是30min粒度时代的宽缓冲
+EXIT_CONSOL_MODE = os.environ.get('CHAN_EXIT_CONSOL', 'high')
+EXIT_ZG_FACTOR = float(os.environ.get('CHAN_EXIT_ZG', '0.99'))
+# 三买纠错(2026-08-17, 53课对齐, ALGORITHM.md §7.19, 环境变量可做归因实验):
+#   CHAN_B3_STRICT_ZG: '0'=旧0.98容差 | '1'=bar.low破ZG即作废 | '2'=bar.close破ZG即作废
+#     | '3'(默认)=当日15:00收盘bar破ZG才作废(日线级确认)
+#     归因实验: '1'/'2'误杀300930(+37.2%: 回试盘中/收盘曾探18.53~18.76 vs ZG18.79,
+#     当日14:30即收回19.02); '3'区分: 300930当日收在ZG上方→存活,
+#     600269(08-15收4.69<4.70)→作废
+#   CHAN_B3_PB_MAX: 回试时间边界(30min bar数), 0=关闭 — 防"数月后跌回老中枢"被当回试
+#   CHAN_B3_BI_REQUIRED: 回试须有已确认30min向下笔(次级别走势完成), 默认关
+#     (T1归因实验: 开启会因"笔确认滞后3根bar"误杀抄底时点的赢家, 保留开关待后续精化)
+B1_DIRECT_ENTRY = os.environ.get('CHAN_B1_DIRECT', '0') == '1'   # 实验: 直接一买入场
+B3_STRICT_ZG = os.environ.get('CHAN_B3_STRICT_ZG', '3')
+THIRD_BUY_PULLBACK_MAX_BARS = int(os.environ.get('CHAN_B3_PB_MAX', '0'))
+B3_BI_REQUIRED = os.environ.get('CHAN_B3_BI_REQUIRED', '0') == '1'
+# B3_NEW_CENTER_KILL(2026-08-17, 失败案例600076/301518驱动, 53课三卖结构):
+# 候选中心结束后, 若形成了新的向上中枢, 当日15:00收盘跌破其ZD → 上涨结构已坏
+# (涨完跌回老中枢 ≠ 回试), 候选作废。600269的新中枢[4.86,5.09]同样被此条覆盖。
+# 默认'1'(开, 2026-08-17用户定调): 缠论正确性优先 — "涨完跌回老中枢"与"被政策
+# 行情救回的真低点"(300930+37.2%, 924)在入场时刻结构同形, 缠论的处理是都不入场;
+# 错过暴力反转是守结构的诚实代价, 不能用运气倒推放松结构(用户: 不应因运气放弃正确性)。
+# rE回归: 30笔40% -1.38%为严格口径的诚实数字; 保守口径可用 CHAN_B3_NEW_CENTER_KILL=0
+B3_NEW_CENTER_KILL = os.environ.get('CHAN_B3_NEW_CENTER_KILL', '1') == '1'
 SIGNAL_WINDOW_WEEKS = 26   # 二买/三买入场窗口(sig后26周; 笔级二买只生成一次无重复,
                            # 窗口需覆盖"回调后价格回踩C区"的时机: 002583 sig4/22入场6月)
 BUY1_WINDOW_WEEKS = 26     # 一买中阴边界(101课: 只有中阴状态下才有第一、二类买点;
@@ -732,6 +762,7 @@ def backtest_one(symbol: str, sdt="20260101", edt="20260804", conn=None,
     dead = set()
     cand_keys = set()   # signal槽去重；同日一买若来源更新则以最近中枢替换
     leave_phase = {}
+    leave_at = {}   # 53课: 三买离开ZG的bar索引(回试时间边界起点)
     pending = None
     m30_ok = set()
     m30_last_check = {}
@@ -923,12 +954,12 @@ def backtest_one(symbol: str, sdt="20260101", edt="20260804", conn=None,
                 out['thresholds'] = {'ZG': float(zg_) if zg_ else None,
                                      'zone_low_exclusive': float(zg_) if zg_ else None,
                                      'zone_high': float(zg_ * 1.05) if zg_ else None,
-                                     'fractal_low': float(zg_ * 0.98) if zg_ else None,
+                                     'fractal_low': float(zg_) if zg_ else None,
                                      'fractal_high': float(zg_ * 1.05) if zg_ else None}
                 out['predicates'].update({
                     'has_ZG': zg_ > 0, 'leave_then_pullback': leave_phase.get(key_) == 'pullback',
                     'price_in_zone': bool(zg_ and zg_ < cur_ <= zg_ * 1.05),
-                    'fractal_in_zone': bool(zg_ and df_low_ is not None and zg_ * 0.98 <= df_low_ <= zg_ * 1.05),
+                    'fractal_in_zone': bool(zg_ and df_low_ is not None and zg_ <= df_low_ <= zg_ * 1.05),
                 })
             elif c.buy_type == '二买':
                 A_, C_ = float(c.a_price or 0), float(c.c_price or c.a_price or 0)
@@ -1049,6 +1080,8 @@ def backtest_one(symbol: str, sdt="20260101", edt="20260804", conn=None,
         m30_cursor.update(_b)
     last_bi_n = len(m30_cursor.bis)   # 卖点检查: 新笔增量检测(2026-08-11)
     last_daily_updated = None   # 已喂入日K的最后日期
+    daily_zs_bi_n = -1          # B3_NEW_CENTER_KILL: 日线中枢缓存对应的笔数
+    daily_zs_list = []          # B3_NEW_CENTER_KILL: 当前可见日线中枢列表
 
     for idx in range(start_idx, len(bars)):
         bar = bars[idx]
@@ -1183,6 +1216,11 @@ def backtest_one(symbol: str, sdt="20260101", edt="20260804", conn=None,
             _dj = d_idx.get(day_str)
             if _dj is not None:       # 日K缺失(新股首日等)则跳过, 与原strftime未命中等价
                 d_cursor.update(bars_d[_dj])
+            # B3_NEW_CENTER_KILL: 新日K笔确认后重建日线中枢缓存(每日至多一次)
+            if B3_NEW_CENTER_KILL and len(d_cursor.bis) != daily_zs_bi_n:
+                daily_zs_bi_n = len(d_cursor.bis)
+                clear_level('D')
+                daily_zs_list = build_zs(d_cursor.bis, level='D')
         if day_str != last_scan_day:
             last_scan_day = day_str
             if diff_d is not None:
@@ -1472,6 +1510,33 @@ def backtest_one(symbol: str, sdt="20260101", edt="20260804", conn=None,
                 eff_start = max(c.signal_date[:10], c.zs_end_date[:10]) if c.zs_end_date else c.signal_date[:10]
                 if day_str < eff_start:
                     continue
+                # B3_NEW_CENTER_KILL(53课三卖结构, 2026-08-17, 600076/301518/600269驱动,
+                # F1强化: 2026-08-17失败单600939/000955/600160/002879/002831驱动):
+                # 候选中心结束后, 只要形成了任何已完结的新日线中枢(不分方向) → 作废。
+                # 53课: 回试是次级别(30min)走势, 不应久到形成新日线中枢;
+                # 新中枢形成=日线结构已重构(新向下中枢=反转结构; 新向上中枢内入场
+                # 也应按新中枢重新评估)。旧版只查"新向上中枢且收盘跌破其ZD",
+                # 漏掉600939型(新向下中枢)与002831型(新向上中枢区间内入场)
+                # 每根bar检查(不限15:00): 候选10:00生成、14:00可能入场,
+                # 15:00才检查会漏(002831: 12-26 10:00生成→14:00入场→15:00才作废)
+                if B3_NEW_CENTER_KILL:
+                    z_end = c.zs_end_date[:10] if c.zs_end_date else ''
+                    for _nz in daily_zs_list:
+                        # 不要求is_complete: 三笔重叠=新日线中枢已出现, 回试窗口已过
+                        # (600939: 新向下中枢[3.19,3.49]尚未被离开笔封闭, 但价格已
+                        #  3.14→4.81→3.84往返, 老候选仍按ZG=3.67入场)
+                        if (_nz.start_dt[:10] >= z_end
+                                and _nz.zg > _nz.zd * 1.003):
+                            if audit_trace and key not in dead:
+                                _cand_event(c, bar.dt.strftime('%Y-%m-%d %H:%M:%S'),
+                                            'invalidated', 'invalidated',
+                                            'new daily center formed after source center (53课回试不该含日线中枢)',
+                                            {'new_center': f'{_nz.start_dt[:10]}~{_nz.end_dt[:10]}',
+                                             'new_dir': _nz.sdir,
+                                             'new_ZG': float(_nz.zg),
+                                             'new_ZD': float(_nz.zd)})
+                            dead.add(key)
+                            break
                 ph = leave_phase.get(key)
                 if ph is None:
                     ph = 'wait_leave'
@@ -1479,12 +1544,33 @@ def backtest_one(symbol: str, sdt="20260101", edt="20260804", conn=None,
                 if ph == 'wait_leave':
                     if bar.high > zg:
                         leave_phase[key] = 'pullback'
+                        leave_at[key] = idx   # 53课: 回试时间边界起点
                 else:
-                    if bar.low < zg * 0.98:
+                    # 53课纠错(2026-08-17, ALGORITHM.md §7.19):
+                    # ① 回试不破ZG — 删除0.98容差; 模式'3'(默认)当日15:00收盘bar
+                    #   破ZG才作废(日线级确认, 盘中/日内噪声不算)
+                    # ② 回试时间边界(可选, CHAN_B3_PB_MAX>0): 防"数月后跌回老中枢"被当回试
+                    brk = None
+                    if B3_STRICT_ZG == '1':
+                        brk = bar.low
+                    elif B3_STRICT_ZG == '2':
+                        brk = bar.close
+                    elif B3_STRICT_ZG == '3' and bar.dt.strftime('%H:%M') == '15:00':
+                        brk = bar.close
+                    if brk is not None and brk < zg:
                         if audit_trace and key not in dead:
                             _cand_event(c, bar.dt.strftime('%Y-%m-%d %H:%M:%S'),
-                                        'invalidated', 'invalidated', 'pullback broke ZG*0.98',
-                                        {'bar_low': float(bar.low), 'threshold': float(zg * .98)})
+                                        'invalidated', 'invalidated', 'pullback broke ZG',
+                                        {'bar_low': float(bar.low), 'bar_close': float(bar.close),
+                                         'threshold': float(zg)})
+                        dead.add(key)
+                    elif THIRD_BUY_PULLBACK_MAX_BARS > 0 \
+                            and idx - leave_at.get(key, idx) > THIRD_BUY_PULLBACK_MAX_BARS:
+                        if audit_trace and key not in dead:
+                            _cand_event(c, bar.dt.strftime('%Y-%m-%d %H:%M:%S'),
+                                        'invalidated', 'invalidated', 'pullback not completed in time',
+                                        {'bars_since_leave': idx - leave_at.get(key, idx),
+                                         'max_bars': THIRD_BUY_PULLBACK_MAX_BARS})
                         dead.add(key)
                     # (2026-08-13 r6: 曾加P0-2"第一次回试完成→候选作废"追踪 —
                     #  杀3笔失败单-9.8%但误杀2笔盈利单+19.5%, 净-9.7pt, 已回滚)
@@ -1638,16 +1724,53 @@ def backtest_one(symbol: str, sdt="20260101", edt="20260804", conn=None,
                         # (2026-08-12修复: 原10根30min bar=1.25个交易日, 与注释
                         #  "10个交易日"不符 — 改为80根=10个交易日; 配合b2失效机制)
                         exit_sig = f"破A确认(10天新低 A={a:.2f})"
-            # ④-5 三买盘整高点回撤(21课: "一旦不能出现趋势, 一定要在盘整的高点出掉")
-            # S2(2026-08-12): 仅三买(entry_zg非0); 持仓>40根后, 从持仓期高点回落>5%即出 —
-            # 近似"不能出现趋势"(不创新高)→盘整高点离场。样本内13笔三买反事实+47.9pt, 3笔亏转盈
-            # (2026-08-13 r2回归: 曾尝试扩展至"盘整型二买"(peak30<入场×1.10),
-            #  结果000062 +236%→-2.6%等趋势赢家全灭, 总盈亏+429%→+113%, 已回滚)
-            if not exit_sig and pos.get('entry_zg') and (idx - pos['entry_idx']) > 40 \
-                    and cur < pos.get('peak30', 0) * 0.95:
-                exit_sig = f"盘整高点回撤(21课) peak={pos.get('peak30', 0):.2f}"
-            # ⑤ 破三买ZG(29课: 三买失败=回抽破中枢; S2收紧0.97→0.99: 快死单提前离场)
-            if not exit_sig and pos.get('entry_zg') and cur < pos['entry_zg'] * 0.99:
+            # ④-5 三买盘整高点(21课: "一旦不能出现趋势, 一定要在盘整的高点出掉")
+            # 重写(2026-08-17, 随机200只×3年回测驱动, ALGORITHM.md §7.18):
+            #   旧版"持仓>40根后峰值回落5%即卖"=在回调低点卖出 — 45/72笔(63%)被终结,
+            #   71%卖后20日涨回>3%(49%>8%), 趋势股被第一波正常回调洗出(S2样本内调优)。
+            #   21课本义: 确认"出不了趋势"后, 在盘整【高点】离场:
+            #     ① 高点区域(cur >= peak30*0.98) + 新30min向上笔确认时顶背驰 → 高点卖
+            #     ② 高点区域连续3根bar无法创新高(bar.high < peak30) → 高点卖
+            #     ③ 趋势兜底: 回撤>=10%(cur < peak30*0.90)才强制离场(替代旧5%)
+            #   仅三买(entry_zg非0), 持仓>40根后启用
+            if EXIT_CONSOL_MODE == 'high':
+                if not exit_sig and pos.get('entry_zg') and (idx - pos['entry_idx']) > 40:
+                    peak30 = pos.get('peak30', 0)
+                    if cur >= peak30 * 0.98:
+                        if len(m30_cursor.bis) > pos.get('m30_bi_n_consol', 0):
+                            pos['m30_bi_n_consol'] = len(m30_cursor.bis)
+                            ok_top, note_top = _m30_top_divergence(
+                                m30_cursor.bis, bars, diff, dea, idx, m30_idx)
+                            if ok_top:
+                                exit_sig = f"盘整高点(21课背驰) {note_top}"
+                        if not exit_sig and bar.high < peak30:
+                            w = pos.get('consol_weak', 0) + 1
+                            pos['consol_weak'] = w
+                            if w >= 3:
+                                exit_sig = f"盘整高点(21课不创新高) peak={peak30:.2f}"
+                        else:
+                            pos['consol_weak'] = 0
+                    else:
+                        pos['consol_weak'] = 0
+                        if cur < peak30 * 0.90:
+                            exit_sig = f"盘整回撤兜底(10%) peak={peak30:.2f}"
+            elif EXIT_CONSOL_MODE == 'off':
+                pass   # 趋势单管理: 三买不用盘整高点规则(21课前提是盘整买点)
+            else:
+                # 旧版(保留作A/B对照, CHAN_EXIT_CONSOL=retrace)
+                if not exit_sig and pos.get('entry_zg') and (idx - pos['entry_idx']) > 40 \
+                        and cur < pos.get('peak30', 0) * 0.95:
+                    exit_sig = f"盘整高点回撤(21课) peak={pos.get('peak30', 0):.2f}"
+            # ⑤ 破三买ZG(29课: 三买失败=回抽跌破中枢 → 卖出信号, 立即执行)
+            # 2026-08-17实验记录: 曾改89课破位预警版(跌破先预警等反弹确认) —
+            # ① 89课"不被震出"语境是底部一买/二买的中阴状态, 不适用于三买失败;
+            # ② 实测4笔等待期价格续跌恶化到-10%硬止损, 净-1.38%→-1.80% — 已撤回。
+            # F2(2026-08-17): 破位判定对齐【日K收盘】(15:00bar) — 30min收盘噪声
+            # 不该触发结构破坏(rE实证: 结构止损6笔卖后40日涨回+2.4%~+14.5%,
+            # 系统性卖在坑底); 29课的"回抽跌破中枢"是日线级结构事件
+            if not exit_sig and pos.get('entry_zg') \
+                    and bar.dt.strftime('%H:%M') == '15:00' \
+                    and cur < pos['entry_zg'] * EXIT_ZG_FACTOR:
                 exit_sig = f"结构止损(ZG={pos['entry_zg']:.2f})"
             # ⑥ 兜底(工程保险)
             if not exit_sig and pnl < -0.10:
@@ -1733,6 +1856,15 @@ def backtest_one(symbol: str, sdt="20260101", edt="20260804", conn=None,
                     key = (bc.buy_type, bc.signal_date)
                     if leave_phase.get(key) != 'pullback':
                         continue
+                    # 53课纠错(2026-08-17, ALGORITHM.md §7.19): 回试=次级别走势完成 —
+                    # 必须出现已确认的30min向下笔, 其终点(=回试低点)不破ZG。
+                    # 底分型≠走势完成(600269: 下跌中继分型抄底, 之后跌至4.06)
+                    if B3_BI_REQUIRED:
+                        if not m30_cursor.bis or m30_cursor.bis[-1].direction != 'down':
+                            continue
+                        pb_bi = m30_cursor.bis[-1]
+                        if pb_bi.end_price < zg:
+                            continue
                     in_zg_zone = zg < cur <= zg * 1.05
                     if in_zg_zone:
                         if key not in in_zone or in_zone[key] is None:
@@ -1745,7 +1877,9 @@ def backtest_one(symbol: str, sdt="20260101", edt="20260804", conn=None,
                     if df_idx < len(sub_bars) - 6:
                         continue
                     df_low = sub_bars[df_idx].low
-                    if not (zg * 0.98 <= df_low <= zg * 1.05):
+                    # 回试低点噪声带: 模式'2'允许1%影线下探(收盘破位已由kill把关)
+                    df_lo = {'1': zg, '2': zg * 0.99}.get(B3_STRICT_ZG, zg * 0.98)
+                    if not (df_lo <= df_low <= zg * 1.05):
                         continue
                     if bar.low < df_low:
                         continue
@@ -1759,7 +1893,9 @@ def backtest_one(symbol: str, sdt="20260101", edt="20260804", conn=None,
                     # "跌破一买完全可以"; 16课操作级买点=次级别回抽结束点=二买)。
                     # 一买候选生成/结构破坏跟踪/二买Phase 4b均保留(二买链依赖),
                     # 仅关闭一买开仓分支 — 一买后等二买(次级别回抽)再介入。
-                    continue
+                    # B1_DIRECT_ENTRY=1(实验): 恢复直接入场, 测试一买候选的独立表现
+                    if not B1_DIRECT_ENTRY:
+                        continue
                     if bc.a_price <= 0:
                         continue
                     if bars_d is None or diff_d is None:

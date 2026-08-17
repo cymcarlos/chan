@@ -41,12 +41,14 @@ def _bis_with_confirmed_lows(bars, *indices):
     bis = [SimpleNamespace(
         direction='up', end_dt=bars[0].dt.strftime('%Y-%m-%d'),
         end_price=bars[0].high, confirm_at=bars[1].dt.strftime('%Y-%m-%d'),
+        start_dt=bars[0].dt.strftime('%Y-%m-%d'),
     ) for _ in range(10)]
     for index in indices:
         bis.append(SimpleNamespace(
             direction='down', end_dt=bars[index].dt.strftime('%Y-%m-%d'),
             end_price=bars[index].low,
             confirm_at=bars[index + 1].dt.strftime('%Y-%m-%d'),
+            start_dt=bars[index - 5].dt.strftime('%Y-%m-%d'),
         ))
     return bis
 
@@ -116,7 +118,9 @@ class FirstBuyCenterProvenanceTest(unittest.TestCase):
         self.assertEqual('formal-first-buy/v1', evidence['schema_version'])
         self.assertEqual({'A': 0, 'B': 1}, evidence['raw_center_indices'])
         self.assertEqual(centers[1].leave_confirm_at, evidence['B_complete_at'])
-        self.assertEqual(bars[101].dt.strftime('%Y-%m-%d'),
+        # §7.20: C段=背驰段(终点为趋势低点的确认向下笔), 起点=该笔的start_dt
+        # (旧语义为b.end+1=bar 101; 新语义为笔起点=bar 105)
+        self.assertEqual(bars[105].dt.strftime('%Y-%m-%d'),
                          evidence['segments']['C']['start_at'])
         self.assertEqual(bounded_signal, evidence['segments']['C']['low_at'])
         self.assertEqual(5.0, evidence['segments']['C']['low'])
@@ -153,11 +157,8 @@ class FirstBuyCenterProvenanceTest(unittest.TestCase):
                 _zs(80, 100, 6.5, 7.0, 6.0, 7.5, confirmed=False),
                 _zs(140, 160, 4.0, 5.0, 3.0, 5.5, direction='向上'),
             ],
-            'B_confirmed_after_C_low': [
-                _zs(40, 60, 9.0, 10.0, 8.0, 11.0),
-                late_confirm_b,
-                _zs(140, 160, 4.0, 5.0, 3.0, 5.5, direction='向上'),
-            ],
+            # §7.20: B确认晚于C低点不再构成拒绝理由 — 趋势低点本就是B完结前
+            # 由已确认向下笔标记的因果数据; 该场景单独正向断言(见下)
         }
         for label, centers in cases.items():
             with self.subTest(label=label), \
@@ -166,6 +167,32 @@ class FirstBuyCenterProvenanceTest(unittest.TestCase):
                 candidates = scan_daily_on_bis(
                     fake_bis, bars, [0.0] * len(bars), [0.0] * len(bars))
                 self.assertFalse(any(c.buy_type == '一买' for c in candidates))
+
+    def test_B_confirmed_after_C_low_is_now_accepted(self):
+        """§7.20: 背驰段终点在B完结确认之前是正常时点关系, 必须生成候选。"""
+        bars = [_bar(i) for i in range(220)]
+        bars[30].high = 20.0
+        bars[110].low = 5.0
+        fake_bis = _bis_with_confirmed_lows(bars, 110)
+
+        def fake_area(_diff, _dea, _start, end, _direction):
+            return -100.0 if end == 40 else -1.0
+
+        late_confirm_b = _zs(80, 100, 6.5, 7.0, 6.0, 7.5)
+        late_confirm_b.leave_confirm_at = bars[130].dt.strftime('%Y-%m-%d')
+        centers = [
+            _zs(40, 60, 9.0, 10.0, 8.0, 11.0),
+            late_confirm_b,
+            _zs(140, 160, 4.0, 5.0, 3.0, 5.5, direction='向上'),
+        ]
+        with patch('chan.daily_scan.build_zs', return_value=centers), \
+                patch('chan.daily_scan.macd_area', side_effect=fake_area):
+            candidates = scan_daily_on_bis(
+                fake_bis, bars, [0.0] * len(bars), [0.0] * len(bars))
+        first_buys = [c for c in candidates if c.buy_type == '一买']
+        self.assertEqual(1, len(first_buys))
+        self.assertEqual(bars[110].dt.strftime('%Y-%m-%d'),
+                         first_buys[0].signal_date)
 
     def test_formal_first_buy_does_not_skip_an_intervening_center(self):
         bars = [_bar(i) for i in range(220)]

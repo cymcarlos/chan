@@ -39,7 +39,9 @@ class AuditTraceCompatibilityTest(unittest.TestCase):
             _reset_engine_caches()
             kwargs = {} if value == 'omitted' else {'audit_trace': value}
             cls.outputs.append(engine.backtest_one(
-                '300314.SZ', '20240101', '20260805', conn=cls.conn, **kwargs))
+                '605507.SH', '20240101', '20260805', conn=cls.conn, **kwargs))
+                # (2026-08-17: 原固件300314.SZ→600579.SH→605507.SH, 均在严格53课规则下被逐级过滤;
+                #  它的三买正是"涨完跌回老中枢"型, 被 B3_NEW_CENTER_KILL 正确过滤)
 
     @classmethod
     def tearDownClass(cls):

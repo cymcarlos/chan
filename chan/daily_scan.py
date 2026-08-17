@@ -114,8 +114,12 @@ def scan_daily_on_bis(bis, bars, diff, dea, d_idx=None):
     #  ① A/B必须在原始同级中枢序列中直接相邻；不能跳过向上或窄中枢配对。
     #  ② 两者均已确认，且 B.ZG < A.ZD（108课的两个中枢区间不重叠）。
     #     更严格的 B.GG < A.DD 作为诊断项报告，不作为课本硬门槛。
-    #  ③ C严格从B结束后的第一根日K开始，并在下一个原始同级中枢前截止。
-    #  ④ C必须相对B.DD创新低，且MACD平均力度背驰；盘整背驰不生成正式一买。
+    #  ③ 背驰段(C) = 终点为趋势最低点的已确认向下笔(61课: 趋势的最后一段下跌)。
+    #     2026-08-17修复(§7.20): 旧版从"B完结确认之后"(b.end+1)划C并要求跌破B.DD —
+    #     中枢延伸语义把趋势最后一段下跌吞进B(其低点就是DD), B完结时价格往往已反转,
+    #     "之后创新低"结构上几乎不可能(485个候选仅4个过, 时点错位)。
+    #  ④ C必须创出整个趋势的新低(低于背驰段之前的全部低点), 且MACD平均力度背驰；
+    #     盘整背驰(未创趋势新低)不生成正式一买。
     eligible_zs_ids = {id(z) for z in zs_L1}
 
     def _complete_zs(z):
@@ -172,22 +176,24 @@ def scan_daily_on_bis(bis, bars, diff, dea, d_idx=None):
         if a_s0 - hi < 5:
             continue
         area_A = macd_area(diff, dea, hi, a_s0, 'down')
-        # C段: b.end之后离开b中枢的段(到c低点)。若其后已经形成新的同级
-        # 中枢，C段必须在新中枢开始前截止；不能让历史b中枢跨过后续中枢，
-        # 重新绑定到多年后的新低点。
+        # 背驰段(C)重定义(2026-08-17, §7.20): 趋势终点区 = B.start → 下一原始
+        # 同级中枢start(或数据末端); 背驰段 = 终点为趋势最低点的已确认向下笔。
+        # 该笔在中枢延伸语义下常是B的成员笔(旧版因此漏判); 创新低参照 = 背驰段
+        # 之前的整个趋势低点(而非b.dd — DD常被延伸压到背驰点本身, 判定退化)。
         b_e = _bar_idx(b.end_dt)
+        z_s0 = _bar_idx(b.start_dt)
         if b_zs_i + 1 < len(all_zs_L1):
             next_zs_start = _bar_idx(all_zs_L1[b_zs_i + 1].start_dt)
-            c_sub = bars[b_e + 1:max(b_e + 1, next_zs_start)]
+            z_e0 = next_zs_start
         else:
-            c_sub = bars[b_e + 1:]
-        if not c_sub:
+            next_zs_start = None
+            z_e0 = len(bars)
+        if z_e0 <= z_s0:
             continue
-        min_bar = min(c_sub, key=lambda x: x.low)
+        zone = bars[z_s0:z_e0]
+        min_bar = min(zone, key=lambda x: x.low)
         c_low = min_bar.low
-        c_low_i = b_e + 1 + c_sub.index(min_bar)
-        if b_confirm_i > c_low_i or c_low >= b.dd:
-            continue   # B尚未确认，或C没有相对B.DD创新低
+        c_low_i = z_s0 + zone.index(min_bar)
         c_confirm_bis = [
             bi for bi in bis
             if bi.direction == 'down'
@@ -196,13 +202,22 @@ def scan_daily_on_bis(bis, bars, diff, dea, d_idx=None):
             and getattr(bi, 'confirm_at', '')
         ]
         if not c_confirm_bis:
-            continue   # C低点必须是已确认向下笔终点，不能使用仍会漂移的临时最低价
-        c_low_confirm_at = max(bi.confirm_at for bi in c_confirm_bis)
+            continue   # 背驰段低点必须是已确认向下笔终点(因果门), 不能是漂移中的临时低点
+        c_bi = max(c_confirm_bis, key=lambda x: x.end_dt)
+        c_low_confirm_at = c_bi.confirm_at
         c_confirm_i = d_idx.get(c_low_confirm_at[:10])
         if c_confirm_i is None or c_confirm_i >= len(bars):
             continue
-        area_C = macd_area(diff, dea, b_e + 1, c_low_i, 'down')
-        len_A = max(a_s0 - hi, 1); len_C = max(c_low_i - b_e, 1)
+        # 创新低: 低于背驰段之前的整个趋势低点(进入段高点→背驰段起点),
+        # 未创趋势新低 = 盘整背驰 → 不生成正式一买(27课/§7.17.1)
+        c_s0 = _bar_idx(c_bi.start_dt)
+        if c_s0 <= a_s0:
+            continue
+        prev_low = min(x.low for x in bars[hi:c_s0])
+        if c_low >= prev_low:
+            continue
+        area_C = macd_area(diff, dea, c_s0, c_low_i, 'down')
+        len_A = max(a_s0 - hi, 1); len_C = max(c_low_i - c_s0, 1)
         if area_A < 0 and area_C < 0 and \
                 abs(area_C) / len_C < abs(area_A) / len_A * 0.9:
             div_type = '趋势背驰'
@@ -236,13 +251,14 @@ def scan_daily_on_bis(bis, bars, diff, dea, d_idx=None):
                         'average_force': float(avg_A),
                     },
                     'C': {
-                        'start_at': bars[b_e + 1].dt.strftime("%Y-%m-%d"),
+                        'start_at': c_bi.start_dt[:10],
                         'end_at': a_date,
                         'low_at': a_date, 'low': float(c_low),
                         'low_confirm_at': c_low_confirm_at,
                         'area': float(area_C), 'length': len_C,
                         'average_force': float(avg_C),
                         'next_center_start_at': next_center_at,
+                        'prev_trend_low': float(prev_low),
                     },
                 },
                 'average_force_ratio_C_to_A': (
@@ -257,13 +273,10 @@ def scan_daily_on_bis(bis, bars, diff, dea, d_idx=None):
                     'B_complete': bool(getattr(b, 'is_complete', False)),
                     'A_has_real_entry_pen': getattr(a, 'member_start_idx', -1) > 0,
                     'center_interval_downshift_ZG2_lt_ZD1': b.zg < a.zd,
-                    'B_confirmed_by_C_low': b_confirm_i <= c_low_i,
-                    'C_starts_after_B_end': b_e + 1 > b_e,
-                    'C_low_before_next_center': (
-                        next_center_at is None or c_low_i < next_zs_start),
-                    'C_makes_new_low_below_B_DD': c_low < b.dd,
+                    'C_low_within_terminal_zone': z_s0 <= c_low_i < z_e0,
                     'C_low_is_confirmed_down_pen_end': bool(c_confirm_bis),
                     'C_low_confirmed_in_available_prefix': c_confirm_i < len(bars),
+                    'C_makes_new_low_below_prev_trend_low': c_low < prev_low,
                     'A_and_C_have_down_macd_area': area_A < 0 and area_C < 0,
                     'C_average_force_lt_A_x_0_9': avg_C < avg_A * 0.9,
                     'trend_divergence_only': div_type == '趋势背驰',
@@ -271,6 +284,7 @@ def scan_daily_on_bis(bis, bars, diff, dea, d_idx=None):
                 'diagnostics': {
                     'strong_full_range_isolation_GG2_lt_DD1': b.gg < a.dd,
                     'full_range_overlap': not (b.gg < a.dd),
+                    'C_low_vs_B_DD': float(c_low - b.dd),
                 },
             }
             canonical = json.dumps(
