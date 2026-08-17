@@ -22,6 +22,9 @@ from chan.bars import macd, macd_area  # noqa: E402
 
 SYMBOL = "002486.SZ"
 SIGNAL_DATE = "2024-06-07"
+STRUCTURE_SNAPSHOT_AT: str | None = None
+STRUCTURE_ASOF_DATE: str | None = None
+STRUCTURE_SNAPSHOT_BASIS: str | None = None
 ENTRY_DATE = "2024-06-19"
 OUTPUT = PROJECT / "bt/audits/002486_interactive_full_20260816"
 
@@ -117,6 +120,12 @@ def centers_with_members(bis: list[Any]) -> list[dict[str, Any]]:
             "GG": round(max(highs), 6),
             "member_ids": [f"bi-{k:03d}" for k in range(i, j)],
             "member_count": j - i,
+            "member_start_idx": i,
+            "member_end_idx": j - 1,
+            "is_complete": j < len(bis),
+            "complete_at": (
+                iso(getattr(bis[j], "confirm_at", "") or bis[j].end_dt)
+                if j < len(bis) else None),
             "eligible": bool(min(highs) > max(lows) * 1.003),
         }
         centers.append(center)
@@ -127,14 +136,13 @@ def centers_with_members(bis: list[Any]) -> list[dict[str, Any]]:
 def diagnose_pairs(
     centers: list[dict[str, Any]], bars: list[Any], diff: list[float], dea: list[float]
 ) -> list[dict[str, Any]]:
-    down = [
-        row for row in centers
-        if row["direction"] == "down" and row.get("eligible", True)
-    ]
     center_pos = {row["id"]: i for i, row in enumerate(centers)}
     d_idx = {row.dt.strftime("%Y-%m-%d"): i for i, row in enumerate(bars)}
     diagnostics = []
-    for order, (a, b) in enumerate(zip(down, down[1:])):
+    for order, (a, b) in enumerate(zip(centers, centers[1:])):
+        if (a["direction"] != "down" or b["direction"] != "down"
+                or not a.get("eligible") or not b.get("eligible")):
+            continue
         a_s0 = d_idx[a["start"][:10]]
         hi = a_s0
         for k in range(a_s0 - 1, max(0, a_s0 - 60), -1):
@@ -152,7 +160,7 @@ def diagnose_pairs(
         min_bar = min(c_sub, key=lambda x: x.low)
         c_i = b_e + 1 + c_sub.index(min_bar)
         area_a = float(macd_area(diff, dea, hi, a_s0, "down"))
-        area_c = float(macd_area(diff, dea, b_e, c_i, "down"))
+        area_c = float(macd_area(diff, dea, b_e + 1, c_i, "down"))
         len_a, len_c = max(a_s0 - hi, 1), max(c_i - b_e, 1)
         avg_a, avg_c = abs(area_a) / len_a, abs(area_c) / len_c
         downshift = b["ZG"] < a["ZD"]
@@ -163,7 +171,8 @@ def diagnose_pairs(
         signal = min_bar.dt.strftime("%Y-%m-%d") if new_low else min(
             bars[b_s:b_e + 1], key=lambda x: x.low
         ).dt.strftime("%Y-%m-%d")
-        generated = downshift and divergence
+        complete = bool(a.get("is_complete") and b.get("is_complete"))
+        generated = complete and downshift and new_low and divergence
         diagnostics.append({
             "id": f"pair-{order:02d}",
             "center1": a["id"],
@@ -174,11 +183,13 @@ def diagnose_pairs(
             "center2_dates": [b["start"], b["end"]],
             "downshift": downshift,
             "strict_isolation": b["GG"] < a["DD"],
+            "adjacent_in_raw_center_sequence": True,
+            "both_complete": complete,
             "A_start": bars[hi].dt.strftime("%Y-%m-%d"),
             "A_end": bars[a_s0].dt.strftime("%Y-%m-%d"),
             "A_area": round(area_a, 10),
             "A_length": len_a,
-            "C_start": b["end"][:10],
+            "C_start": bars[b_e + 1].dt.strftime("%Y-%m-%d"),
             "C_end": min_bar.dt.strftime("%Y-%m-%d"),
             "C_low": round(float(min_bar.low), 6),
             "C_area": round(area_c, 10),
@@ -190,7 +201,9 @@ def diagnose_pairs(
             "reason": (
                 "generated"
                 if generated
+                else "center not complete" if not complete
                 else "ZG not downshifted" if not downshift
+                else "C did not make a new low" if not new_low
                 else "MACD segment invalid" if not valid_areas
                 else f"no divergence: C/A={ratio:.3f} >= 0.9"
             ),
@@ -205,19 +218,31 @@ def diagnose_pairs(
     return diagnostics
 
 
+def is_structure_snapshot_scan(bars: list[Any]) -> bool:
+    return bool(
+        STRUCTURE_ASOF_DATE
+        and bars
+        and bars[-1].dt.strftime("%Y-%m-%d") == STRUCTURE_ASOF_DATE
+    )
+
+
 def collect() -> dict[str, Any]:
+    if not STRUCTURE_SNAPSHOT_AT or not STRUCTURE_ASOF_DATE:
+        raise RuntimeError(
+            "structure snapshot is unset; configure first_seen_at/decision_at and its visible daily cutoff"
+        )
     capture: dict[str, Any] = {}
     original_scan = engine.scan_daily_on_bis
 
     def wrapped_scan(*args: Any, **kwargs: Any):
         output = original_scan(*args, **kwargs)
         bis, bars, diff, dea = args[:4]
-        if bars and bars[-1].dt.strftime("%Y-%m-%d") == SIGNAL_DATE and not capture:
+        if is_structure_snapshot_scan(bars) and not capture:
             pens = [pack_pen(pen, i) for i, pen in enumerate(bis)]
             centers = centers_with_members(list(bis))
             diagnostics = diagnose_pairs(centers, list(bars), list(diff), list(dea))
             capture.update({
-                "asof": SIGNAL_DATE,
+                "asof": STRUCTURE_ASOF_DATE,
                 "pens": pens,
                 "centers": centers,
                 "pair_diagnostics": diagnostics,
@@ -241,7 +266,10 @@ def collect() -> dict[str, Any]:
         engine.scan_daily_on_bis = original_scan
 
     if not capture:
-        raise RuntimeError("failed to capture signal-time daily structure")
+        raise RuntimeError(
+            f"failed to capture daily structure visible at {STRUCTURE_SNAPSHOT_AT} "
+            f"(daily cutoff {STRUCTURE_ASOF_DATE})"
+        )
     trade = next(row for row in replay["trades"] if row.get("entry") == ENTRY_DATE)
     audit = trade["audit"]
     candidate_map = {row["candidate_id"]: row for row in replay["audit_trace"]["candidates"]}
@@ -256,6 +284,39 @@ def collect() -> dict[str, Any]:
     child = candidate_map.get(adopted_id)
     source_id = (child or {}).get("source_b1_id") or audit.get("source_b1_id")
     source = candidate_map.get(source_id)
+    formal = ((source or {}).get("structure") or {}).get("formal_first_buy") or {}
+    formal_a = (formal.get("centers") or {}).get("A") or {}
+    formal_b = (formal.get("centers") or {}).get("B") or {}
+    if formal_a and formal_b:
+        for row in capture["pair_diagnostics"]:
+            row.pop("selected_by_engine", None)
+        selected = next((
+            row for row in capture["pair_diagnostics"]
+            if row.get("center1_dates", [None])[0][:10] == str(formal_a.get("start_at"))[:10]
+            and row.get("center2_dates", [None])[0][:10] == str(formal_b.get("start_at"))[:10]
+        ), None)
+        if selected is None:
+            raise RuntimeError("frozen report could not bind the exact formal first-buy center pair")
+        seg_a = (formal.get("segments") or {}).get("A") or {}
+        seg_c = (formal.get("segments") or {}).get("C") or {}
+        selected.update({
+            "selected_by_engine": True,
+            "A_start": seg_a.get("start_at"), "A_end": seg_a.get("end_at"),
+            "A_area": seg_a.get("area"), "A_length": seg_a.get("length"),
+            "C_start": seg_c.get("start_at"), "C_end": seg_c.get("end_at"),
+            "C_low": seg_c.get("low"), "C_low_confirm_at": seg_c.get("low_confirm_at"),
+            "C_area": seg_c.get("area"), "C_length": seg_c.get("length"),
+            "force_ratio": formal.get("average_force_ratio_C_to_A"),
+            "downshift": bool((formal.get("invariants") or {}).get(
+                "center_interval_downshift_ZG2_lt_ZD1")),
+            "strict_isolation": bool((formal.get("diagnostics") or {}).get(
+                "strong_full_range_isolation_GG2_lt_DD1")),
+            "new_low": bool((formal.get("invariants") or {}).get(
+                "C_makes_new_low_below_B_DD")),
+            "generated": all((formal.get("invariants") or {}).values()),
+            "reason": "exact engine formal-first-buy evidence",
+            "provenance_id": formal.get("provenance_id"),
+        })
     ids = {source_id, adopted_id}
     events = [
         row for row in replay["audit_trace"]["candidate_events"]
@@ -299,6 +360,9 @@ def collect() -> dict[str, Any]:
         "schema": "render-chan-interactive-report/raw-v1",
         "symbol": SYMBOL,
         "generated_at": datetime.now().astimezone().isoformat(),
+        "structure_snapshot_at": STRUCTURE_SNAPSHOT_AT,
+        "structure_snapshot_basis": STRUCTURE_SNAPSHOT_BASIS,
+        "structure_asof_date": STRUCTURE_ASOF_DATE,
         "daily": daily,
         "m30": m30,
         "daily_pens": capture["pens"],
@@ -337,32 +401,32 @@ HTML = r'''<!doctype html>
 <title>002486.SZ 全证据交互审查</title>
 <style>
 :root{--bg:#07101e;--panel:#101a2d;--panel2:#15223a;--ink:#e9f1ff;--muted:#91a3be;--line:#2a3a58;--red:#fb7185;--green:#34d399;--blue:#60a5fa;--gold:#facc15;--purple:#a78bfa;--orange:#fb923c}
-*{box-sizing:border-box}body{margin:0;background:linear-gradient(150deg,#07101e,#101a30 58%,#08111f);color:var(--ink);font:14px/1.55 system-ui,"Microsoft YaHei",sans-serif}main{max-width:1540px;margin:auto;padding:24px}h1{font-size:30px;margin:0 0 4px}h2{font-size:21px;margin:0 0 10px}h3{font-size:16px;margin:0 0 8px}.muted{color:var(--muted)}.hero,.section{background:rgba(16,26,45,.96);border:1px solid var(--line);border-radius:14px;padding:18px;margin:16px 0}.hero{border-left:5px solid var(--red)}.hero-title{font-size:22px;font-weight:700;margin:8px 0}.badge{display:inline-block;padding:3px 9px;border-radius:999px;background:#502434;color:#ffbdc7;margin-right:6px}.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:9px;margin-top:14px}.metric{background:var(--panel2);padding:10px;border-radius:8px;border:1px solid var(--line)}.metric span{display:block;color:var(--muted);font-size:12px}.metric strong{font-size:17px}.controls{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:8px 0 10px}.controls button,.controls select{border:1px solid var(--line);background:#172640;color:var(--ink);padding:6px 10px;border-radius:7px;cursor:pointer}.controls button:hover{background:#203453}.controls label{display:inline-flex;align-items:center;gap:5px;color:#c8d6ec}.chart-shell{position:relative;border:1px solid var(--line);border-radius:10px;background:#0a1324;overflow:hidden}.chart-shell canvas{display:block;width:100%;height:560px;cursor:crosshair}.tooltip{display:none;position:absolute;z-index:5;pointer-events:none;max-width:320px;background:#07101eee;border:1px solid #52627d;border-radius:8px;padding:8px 10px;color:var(--ink);font-size:12px;white-space:nowrap}.legend{display:flex;gap:15px;flex-wrap:wrap;color:var(--muted);margin:6px 0}.sw{display:inline-block;width:12px;height:9px;margin-right:5px;vertical-align:middle}.sw.stale{background:#fb718566;border:1px solid var(--red)}.sw.local{background:#34d39944;border:1px solid var(--green)}.sw.other{background:#a78bfa33;border:1px solid var(--purple)}.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--line);vertical-align:top}th{color:#b8c7df;background:#142139;position:sticky;top:0}tr[data-focus]{cursor:pointer}tr[data-focus]:hover{background:#1b2b47}.status-good{color:var(--green)}.status-bad{color:var(--red)}.status-warn{color:var(--gold)}.mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.explain{padding:12px 14px;background:#251d13;border-left:4px solid var(--gold);border-radius:7px}.event-line{display:grid;grid-template-columns:160px 120px 1fr;gap:9px;padding:7px 0;border-bottom:1px solid var(--line)}details{background:#0b1425;border:1px solid var(--line);border-radius:8px;padding:10px;margin-top:10px}summary{cursor:pointer;font-weight:700}pre{white-space:pre-wrap;word-break:break-all;max-height:440px;overflow:auto;color:#c9d6ea}.foot{color:var(--muted);font-size:12px;margin:16px 2px}@media(max-width:820px){main{padding:12px}.grid2{grid-template-columns:1fr}.chart-shell canvas{height:460px}.event-line{grid-template-columns:1fr}.hero-title{font-size:19px}}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(150deg,#07101e,#101a30 58%,#08111f);color:var(--ink);font:14px/1.55 system-ui,"Microsoft YaHei",sans-serif}main{max-width:1540px;margin:auto;padding:24px}h1{font-size:30px;margin:0 0 4px}h2{font-size:21px;margin:0 0 10px}h3{font-size:16px;margin:0 0 8px}.muted{color:var(--muted)}.hero,.section{background:rgba(16,26,45,.96);border:1px solid var(--line);border-radius:14px;padding:18px;margin:16px 0}.hero{border-left:5px solid var(--red)}.hero-title{font-size:22px;font-weight:700;margin:8px 0}.badge{display:inline-block;padding:3px 9px;border-radius:999px;background:#502434;color:#ffbdc7;margin-right:6px}.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:9px;margin-top:14px}.metric{background:var(--panel2);padding:10px;border-radius:8px;border:1px solid var(--line)}.metric span{display:block;color:var(--muted);font-size:12px}.metric strong{font-size:17px}.controls{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:8px 0 10px}.controls button,.controls select{border:1px solid var(--line);background:#172640;color:var(--ink);padding:6px 10px;border-radius:7px;cursor:pointer}.controls button:hover{background:#203453}.controls label{display:inline-flex;align-items:center;gap:5px;color:#c8d6ec}.chart-shell{position:relative;border:1px solid var(--line);border-radius:10px;background:#0a1324;overflow:hidden}.chart-shell canvas{display:block;width:100%;height:560px;cursor:crosshair}.tooltip{display:none;position:absolute;z-index:5;pointer-events:none;max-width:320px;background:#07101eee;border:1px solid #52627d;border-radius:8px;padding:8px 10px;color:var(--ink);font-size:12px;white-space:nowrap}.legend{display:flex;gap:15px;flex-wrap:wrap;color:var(--muted);margin:6px 0}.sw{display:inline-block;width:12px;height:9px;margin-right:5px;vertical-align:middle}.sw.stale{background:#fb718566;border:1px solid var(--red)}.sw.local{background:#34d39944;border:1px solid var(--green)}.sw.other{background:#a78bfa33;border:1px solid var(--purple)}.sw.causal{background:#facc1544;border:2px solid var(--gold)}.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--line);vertical-align:top}th{color:#b8c7df;background:#142139;position:sticky;top:0}tr[data-focus]{cursor:pointer}tr[data-focus]:hover{background:#1b2b47}.status-good{color:var(--green)}.status-bad{color:var(--red)}.status-warn{color:var(--gold)}.mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.explain{padding:12px 14px;background:#251d13;border-left:4px solid var(--gold);border-radius:7px}.event-line{display:grid;grid-template-columns:160px 120px 1fr;gap:9px;padding:7px 0;border-bottom:1px solid var(--line)}details{background:#0b1425;border:1px solid var(--line);border-radius:8px;padding:10px;margin-top:10px}summary{cursor:pointer;font-weight:700}pre{white-space:pre-wrap;word-break:break-all;max-height:440px;overflow:auto;color:#c9d6ea}.foot{color:var(--muted);font-size:12px;margin:16px 2px}@media(max-width:820px){main{padding:12px}.grid2{grid-template-columns:1fr}.chart-shell canvas{height:460px}.event-line{grid-template-columns:1fr}.hero-title{font-size:19px}}
 </style></head><body><main>
 <h1>002486.SZ 全证据交互审查</h1>
-<div class="muted">以2024-06-07信号生成时可见数据冻结；滚轮缩放、拖动平移、悬停查看K线与中枢，点击表格行定位结构。</div>
+<div class="muted">结构按引擎首次看到候选（缺失时按决策时点）的可见数据冻结；滚轮缩放、拖动平移、悬停查看K线与中枢，点击表格行定位结构。</div>
 <section class="hero"><div><span class="badge">CODE_DEFECT</span><span class="badge">假一买源链</span></div><div class="hero-title" id="verdict-title"></div><div id="verdict-summary"></div><div class="metrics"><div class="metric"><span>实际采用中枢</span><strong>2020—2021旧结构</strong></div><div class="metric"><span>最近两中枢C/A力度比</span><strong class="status-bad">2.436</strong></div><div class="metric"><span>背驰门槛</span><strong>&lt; 0.900</strong></div><div class="metric"><span>交易结果</span><strong class="status-bad">-14.84%</strong></div></div></section>
 
-<section class="section"><h2>日K：中枢、笔与候选配对</h2><div class="controls" id="daily-controls"><button data-range="context">默认全链</button><button data-range="local">最近结构</button><button data-range="signal">信号窗口</button><button data-range="full">全部数据</button><label><input type="checkbox" data-layer="pens" checked>笔</label><label><input type="checkbox" data-layer="centers" checked>中枢</label><label><input type="checkbox" data-layer="markers" checked>事件</label><label><input type="checkbox" data-layer="macd" checked>MACD</label></div><div class="legend"><span><i class="sw stale"></i>交易实际采用的陈旧中枢对</span><span><i class="sw local"></i>信号前最近中枢对</span><span><i class="sw other"></i>其他中枢</span></div><div class="chart-shell"><canvas id="daily-chart" aria-label="002486日K交互图"></canvas><div class="tooltip" id="daily-tip"></div></div></section>
+<section class="section"><h2>日K：中枢、笔与候选配对</h2><div class="controls" id="daily-controls"><button data-range="context">默认全链</button><button data-range="local">最近结构</button><button data-range="signal">信号窗口</button><button data-range="full">全部数据</button><label><input type="checkbox" data-layer="pens" checked>笔</label><label><input type="checkbox" data-layer="centers" checked>中枢</label><label><input type="checkbox" data-layer="markers" checked>事件</label><label><input type="checkbox" data-layer="macd" checked>MACD</label></div><div class="legend"><span><i class="sw stale"></i>交易实际采用的陈旧中枢对</span><span><i class="sw local"></i>证据快照最近中枢对</span><span><i class="sw other"></i>其他中枢</span></div><div class="chart-shell"><canvas id="daily-chart" aria-label="002486日K交互图"></canvas><div class="tooltip" id="daily-tip"></div></div></section>
 
 <section class="grid2"><div class="section"><h2>所有向下中枢</h2><div class="table-wrap"><table><thead><tr><th>中枢</th><th>时间</th><th>ZD—ZG</th><th>角色</th></tr></thead><tbody id="center-rows"></tbody></table></div></div><div class="section"><h2>相邻中枢对与背驰</h2><div class="table-wrap"><table><thead><tr><th>中枢对</th><th>下移</th><th>C/A力度</th><th>结果</th></tr></thead><tbody id="pair-rows"></tbody></table></div></div></section>
 
 <section class="section"><h2>为什么这是陈旧中枢假一买</h2><div class="explain"><b>程序实际绑定：</b><span id="selected-pair-text"></span><br><b>当时最近结构：</b><span id="local-pair-text"></span><br><b>关键差异：</b>最近两中枢虽然下移且C段创新低，但C段平均下跌力度是A段的2.436倍，不是背驰。旧候选因为扫描顺序和 <span class="mono">(买点类型, 信号日期)</span> 去重键先占位，成为二买的源一买。</div></section>
 
-<section class="section"><h2>30分钟：二买形成、成交与失效</h2><div class="controls" id="m30-controls"><button data-range="setup">形成过程</button><button data-range="position">持仓过程</button><button data-range="full">全部数据</button><label><input type="checkbox" data-layer="pens" checked>笔</label><label><input type="checkbox" data-layer="markers" checked>事件</label><label><input type="checkbox" data-layer="macd" checked>MACD</label></div><div class="chart-shell"><canvas id="m30-chart" aria-label="002486三十分钟交互图"></canvas><div class="tooltip" id="m30-tip"></div></div></section>
+<section class="section"><h2>30分钟：二买形成、成交与失效</h2><div class="controls" id="m30-controls"><button data-range="setup">形成过程</button><button data-range="position">持仓过程</button><button data-range="full">全部数据</button><label><input type="checkbox" data-layer="pens" checked>笔</label><label><input type="checkbox" data-layer="markers" checked>事件</label><label><input type="checkbox" data-layer="macd" checked>MACD</label></div><div class="legend"><span><i class="sw causal"></i>候选确认时实际采用的30分钟回抽笔</span><span><i class="sw other"></i>后来延伸后的完整30分钟笔</span></div><div class="chart-shell"><canvas id="m30-chart" aria-label="002486三十分钟交互图"></canvas><div class="tooltip" id="m30-tip"></div></div></section>
 
 <section class="section"><h2>候选生命周期</h2><div id="events"></div><details><summary>完整交易谓词与证据</summary><pre id="raw-evidence"></pre></details></section>
-<div class="foot">紫色普通中枢和笔均按信号当时冻结状态绘制；中枢带只覆盖真实起止日期，不再横铺整张图。所有成交核对使用数据库原始30分钟K线。</div>
+<div class="foot">紫色普通中枢和笔均按引擎证据快照冻结；历史 signal_at 只作事件标记，不决定结构边界。中枢带只覆盖真实起止日期，不再横铺整张图。所有成交核对使用数据库原始30分钟K线。</div>
 </main><script type="application/json" id="audit-data">__DATA__</script>
 <script>
 const DATA=JSON.parse(document.getElementById('audit-data').textContent);
 const COLORS={bg:'#0a1324',grid:'#263650',text:'#8fa2bd',up:'#34d399',down:'#fb7185',pen:'#60a5fa',center:'#a78bfa',stale:'#fb7185',local:'#34d399',signal:'#facc15',entry:'#38bdf8',exit:'#fb923c',invalid:'#ef4444',decision:'#c084fc'};
-function t(v){return new Date(String(v).replace(' ','T')).getTime()}
+function t(v){let s=String(v??'').trim();if(/^\d{4}-\d{2}-\d{2} \d{6}$/.test(s))s=s.slice(0,13)+':'+s.slice(13,15)+':'+s.slice(15,17);let x=Date.parse(s.replace(' ','T'));return Number.isFinite(x)?x:NaN}
 function fmt(v,n=2){return Number(v).toFixed(n)}
 function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
 function nearestIndex(rows,time){let lo=0,hi=rows.length-1,x=t(time);while(lo<hi){let m=(lo+hi)>>1;if(t(rows[m].at)<x)lo=m+1;else hi=m}if(lo>0&&Math.abs(t(rows[lo-1].at)-x)<Math.abs(t(rows[lo].at)-x))return lo-1;return lo}
 class KChart{
- constructor(canvas,tip,rows,pens,centers,markers,ranges){this.c=canvas;this.ctx=canvas.getContext('2d');this.tip=tip;this.rows=rows;this.pens=pens||[];this.centers=centers||[];this.markers=(markers||[]).filter(x=>x.at);this.ranges=ranges;this.layers={pens:true,centers:true,markers:true,macd:true};this.start=0;this.end=rows.length;this.drag=false;this.cross=null;this.selected=new Set();this.bind();new ResizeObserver(()=>this.draw()).observe(canvas.parentElement)}
+ constructor(canvas,tip,rows,pens,centers,markers,ranges,causalPens=[]){this.c=canvas;this.ctx=canvas.getContext('2d');this.tip=tip;this.rows=rows;this.pens=pens||[];this.causalPens=causalPens||[];this.centers=centers||[];this.markers=(markers||[]).filter(x=>x.at);this.ranges=ranges;this.layers={pens:true,centers:true,markers:true,macd:true};this.start=0;this.end=rows.length;this.drag=false;this.cross=null;this.selected=new Set();this.bind();new ResizeObserver(()=>this.draw()).observe(canvas.parentElement)}
  range(name){let r=this.ranges[name];if(!r){this.start=0;this.end=this.rows.length}else{this.start=Math.max(0,nearestIndex(this.rows,r[0]));this.end=Math.min(this.rows.length,nearestIndex(this.rows,r[1])+1)}if(this.end-this.start<20)this.end=Math.min(this.rows.length,this.start+20);this.draw()}
  focus(a,b,ids=[]){let s=nearestIndex(this.rows,a),e=nearestIndex(this.rows,b),pad=Math.max(12,Math.round((e-s+1)*.35));this.start=Math.max(0,s-pad);this.end=Math.min(this.rows.length,e+pad);this.selected=new Set(ids);this.draw()}
  bind(){this.c.addEventListener('wheel',e=>{e.preventDefault();let r=this.c.getBoundingClientRect(),p=(e.clientX-r.left)/r.width,n=this.end-this.start,newN=Math.max(20,Math.min(this.rows.length,Math.round(n*(e.deltaY>0?1.18:.84)))),anchor=this.start+p*n;this.start=Math.round(anchor-p*newN);this.end=this.start+newN;this.clamp();this.draw()},{passive:false});this.c.addEventListener('pointerdown',e=>{this.drag=true;this.lastX=e.clientX;this.c.setPointerCapture(e.pointerId)});this.c.addEventListener('pointerup',()=>this.drag=false);this.c.addEventListener('pointerleave',()=>{this.drag=false;this.cross=null;this.tip.style.display='none';this.draw()});this.c.addEventListener('pointermove',e=>{let r=this.c.getBoundingClientRect();if(this.drag){let step=(r.width-76)/(this.end-this.start),shift=Math.round((this.lastX-e.clientX)/Math.max(step,.01));if(shift){this.start+=shift;this.end+=shift;this.lastX=e.clientX;this.clamp();this.draw()}return}let idx=Math.floor(this.start+(e.clientX-r.left-58)/Math.max((r.width-76)/(this.end-this.start),.01));idx=Math.max(this.start,Math.min(this.end-1,idx));this.cross=idx;this.showTip(e,idx);this.draw()})}
@@ -372,6 +436,7 @@ class KChart{
  if(this.layers.centers)for(let z of this.centers){let s=nearestIndex(this.rows,z.start),e=nearestIndex(this.rows,z.end);if(e<this.start||s>=this.end)continue;let color=z.role==='selected-stale'?COLORS.stale:z.role==='latest-local'?COLORS.local:COLORS.center;x.globalAlpha=z.role==='normal'?.14:.25;x.fillStyle=color;x.fillRect(Math.max(L,xx(s)-3),yy(z.ZG),Math.max(3,Math.min(w-R,xx(e)+3)-Math.max(L,xx(s)-3)),Math.max(2,yy(z.ZD)-yy(z.ZG)));x.globalAlpha=1;x.strokeStyle=color;x.lineWidth=this.selected.has(z.id)?3:1;x.strokeRect(Math.max(L,xx(s)-3),yy(z.ZG),Math.max(3,Math.min(w-R,xx(e)+3)-Math.max(L,xx(s)-3)),Math.max(2,yy(z.ZD)-yy(z.ZG)));if(n<700){x.fillStyle=color;x.fillText(z.id,Math.max(L+2,xx(s)),Math.max(T+8,yy(z.ZG)-7))}}
  let bw=Math.max(.6,Math.min(7,plotW/n*.62));for(let i=this.start;i<this.end;i++){let d=this.rows[i],px=xx(i),yo=yy(d.o),yc=yy(d.c),yh=yy(d.h),yl=yy(d.l);x.strokeStyle=d.c>=d.o?COLORS.up:COLORS.down;x.fillStyle=x.strokeStyle;x.beginPath();x.moveTo(px,yh);x.lineTo(px,yl);x.stroke();x.fillRect(px-bw/2,Math.min(yo,yc),bw,Math.max(1,Math.abs(yc-yo)))}
  if(this.layers.pens){let pts=[];for(let p of this.pens){for(let q of [[p.start,p.start_price],[p.end,p.end_price]]){let i=nearestIndex(this.rows,q[0]);if(i>=this.start-1&&i<=this.end)pts.push([i,Number(q[1])])}}pts.sort((a,b)=>a[0]-b[0]);x.strokeStyle=COLORS.pen;x.lineWidth=2;x.beginPath();pts.forEach((p,j)=>{let X=xx(p[0]),Y=yy(p[1]);j?x.lineTo(X,Y):x.moveTo(X,Y)});x.stroke()}
+ if(this.layers.pens)for(let p of this.causalPens){let s=nearestIndex(this.rows,p.start),e=nearestIndex(this.rows,p.end);if(e<this.start||s>=this.end)continue;x.strokeStyle=COLORS.signal;x.lineWidth=4;x.setLineDash([7,4]);x.beginPath();x.moveTo(xx(s),yy(Number(p.start_price)));x.lineTo(xx(e),yy(Number(p.end_price)));x.stroke();x.setLineDash([]);x.fillStyle=COLORS.signal;x.beginPath();x.arc(xx(e),yy(Number(p.end_price)),4,0,Math.PI*2);x.fill()}
  if(this.layers.markers)for(let m of this.markers){let i=nearestIndex(this.rows,m.at);if(i<this.start||i>=this.end)continue;let color=COLORS[m.kind]||COLORS.signal,px=xx(i);x.strokeStyle=color;x.setLineDash([5,4]);x.beginPath();x.moveTo(px,T);x.lineTo(px,priceB);x.stroke();x.setLineDash([]);x.fillStyle=color;x.save();x.translate(px+4,T+8);x.rotate(Math.PI/2);x.fillText(m.label,0,0);x.restore()}
  if(this.layers.macd){let top=priceB+16,bot=h-B,zero=(top+bot)/2,max=Math.max(...visible.map(d=>Math.abs(d.macd)),1e-9);x.strokeStyle=COLORS.grid;x.beginPath();x.moveTo(L,zero);x.lineTo(w-R,zero);x.stroke();for(let i=this.start;i<this.end;i++){let d=this.rows[i],hh=Math.abs(d.macd)/max*(bot-top)/2;x.fillStyle=d.macd>=0?COLORS.up:COLORS.down;x.fillRect(xx(i)-Math.max(.5,bw/2),d.macd>=0?zero-hh:zero,Math.max(1,bw),Math.max(.5,hh))}}
  for(let k=0;k<5;k++){let i=Math.min(this.end-1,Math.round(this.start+(n-1)*k/4));x.fillStyle=COLORS.text;x.fillText(this.rows[i].at.slice(0,10),Math.min(w-88,Math.max(L,xx(i)-28)),h-10)}if(this.cross!=null&&this.cross>=this.start&&this.cross<this.end){x.strokeStyle='#dbeafe88';x.setLineDash([3,3]);x.beginPath();x.moveTo(xx(this.cross),T);x.lineTo(xx(this.cross),h-B);x.stroke();x.setLineDash([])}}
@@ -379,15 +444,15 @@ class KChart{
 document.getElementById('verdict-title').textContent=DATA.verdict.title;document.getElementById('verdict-summary').textContent=DATA.verdict.summary;
 const dailyRanges={context:['2020-08-01','2024-08-31'],local:['2023-02-01','2024-07-31'],signal:['2024-04-15','2024-06-30']};
 const m30Ranges={setup:['2024-05-20 10:00:00','2024-06-20 15:00:00'],position:['2024-06-17 10:00:00','2024-06-25 15:00:00']};
-const daily=new KChart(document.getElementById('daily-chart'),document.getElementById('daily-tip'),DATA.daily,DATA.daily_pens,DATA.centers,DATA.markers_daily,dailyRanges);daily.range('context');
-const m30=new KChart(document.getElementById('m30-chart'),document.getElementById('m30-tip'),DATA.m30,DATA.m30_pens,[],DATA.markers_m30,m30Ranges);m30.range('setup');
+const daily=new KChart(document.getElementById('daily-chart'),document.getElementById('daily-tip'),DATA.daily,DATA.daily_pens,DATA.centers,DATA.markers_daily,dailyRanges,[]);daily.range('context');
+const m30=new KChart(document.getElementById('m30-chart'),document.getElementById('m30-tip'),DATA.m30,DATA.m30_pens,[],DATA.markers_m30,m30Ranges,DATA.causal_m30_pens||[]);m30.range('setup');
 function bindControls(id,chart){let root=document.getElementById(id);root.querySelectorAll('button[data-range]').forEach(b=>b.onclick=()=>chart.range(b.dataset.range));root.querySelectorAll('input[data-layer]').forEach(c=>c.onchange=()=>{chart.layers[c.dataset.layer]=c.checked;chart.draw()})}bindControls('daily-controls',daily);bindControls('m30-controls',m30);
 const centers=Object.fromEntries(DATA.centers.map(z=>[z.id,z]));let down=DATA.centers.filter(z=>z.direction==='down');document.getElementById('center-rows').innerHTML=down.map(z=>`<tr data-focus="${z.id}"><td>${esc(z.id)}</td><td>${z.start.slice(0,10)} → ${z.end.slice(0,10)}</td><td>${fmt(z.ZD)}—${fmt(z.ZG)}</td><td class="${z.role==='selected-stale'?'status-bad':z.role==='latest-local'?'status-good':''}">${z.role==='selected-stale'?'实际采用旧结构':z.role==='latest-local'?'最近结构':'普通'}</td></tr>`).join('');
 document.querySelectorAll('#center-rows tr').forEach(tr=>tr.onclick=()=>{let z=centers[tr.dataset.focus];daily.focus(z.start,z.end,[z.id])});
 document.getElementById('pair-rows').innerHTML=DATA.pair_diagnostics.map(p=>`<tr data-focus="${p.id}"><td>${esc(p.center1)} + ${esc(p.center2)}${p.selected_by_engine?'<br><span class="status-bad">实际获胜</span>':p.latest_local_pair?'<br><span class="status-good">最近一对</span>':''}</td><td class="${p.downshift?'status-good':'status-bad'}">${p.downshift?'是':'否'}</td><td class="${p.force_ratio!=null&&p.force_ratio<.9?'status-good':'status-bad'}">${p.force_ratio==null?'—':fmt(p.force_ratio,3)}</td><td>${p.generated?'<span class="status-good">生成</span>':`<span class="status-bad">${esc(p.reason)}</span>`}</td></tr>`).join('');
 document.querySelectorAll('#pair-rows tr').forEach(tr=>tr.onclick=()=>{let p=DATA.pair_diagnostics.find(x=>x.id===tr.dataset.focus),a=centers[p.center1],b=centers[p.center2];daily.focus(a.start,b.end,[a.id,b.id])});
 let sp=DATA.pair_diagnostics.find(x=>x.id===DATA.selected_pair_id),lp=DATA.pair_diagnostics.find(x=>x.id===DATA.local_pair_id);document.getElementById('selected-pair-text').textContent=`${sp.center1_dates[0].slice(0,10)}—${sp.center2_dates[1].slice(0,10)}，第二中枢[${sp.center2_range.join(', ')}]，随后错误跨接到${sp.C_end}。`;document.getElementById('local-pair-text').textContent=`${lp.center1_dates[0].slice(0,10)}—${lp.center2_dates[1].slice(0,10)}，中枢下移=${lp.downshift}，创新低=${lp.new_low}，但C/A力度=${lp.force_ratio}。`;
-document.getElementById('events').innerHTML=DATA.events.map(e=>`<div class="event-line"><span class="mono">${esc(e.at)}</span><b>${esc(e.event)}</b><span>${esc(e.reason||'')}</span></div>`).join('');document.getElementById('raw-evidence').textContent=JSON.stringify({trade:DATA.trade,trade_audit:DATA.trade_audit,source:DATA.source,child:DATA.child,pair_diagnostics:DATA.pair_diagnostics},null,2);
+document.getElementById('events').innerHTML=DATA.events.map(e=>`<div class="event-line"><span class="mono">${esc(e.at)}</span><b>${esc(e.event)}</b><span>${esc(e.reason||'')}</span></div>`).join('');document.getElementById('raw-evidence').textContent=JSON.stringify({structure_snapshot_at:DATA.structure_snapshot_at,structure_snapshot_basis:DATA.structure_snapshot_basis,structure_asof_date:DATA.structure_asof_date,timeline:DATA.timeline,trade:DATA.trade,trade_audit:DATA.trade_audit,source:DATA.source,child:DATA.child,pair_diagnostics:DATA.pair_diagnostics},null,2);
 </script></body></html>'''
 
 

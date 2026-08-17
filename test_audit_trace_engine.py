@@ -77,5 +77,78 @@ class AuditTraceCompatibilityTest(unittest.TestCase):
         self.assertEqual(left['audit_trace'], right['audit_trace'])
 
 
+class FormalSecondBuyLineageTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        db_uri = (PROJECT / 'kline.db').as_uri() + '?mode=ro'
+        cls.conn = sqlite3.connect(db_uri, uri=True)
+        cls.results = {}
+        for symbol in ('000826.SZ', '002749.SZ', '000810.SZ'):
+            _reset_engine_caches()
+            cls.results[symbol] = engine.backtest_one(
+                symbol, '20240101', '20260805', conn=cls.conn, audit_trace=True)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.conn.close()
+
+    def test_real_formal_second_buy_has_exact_non_vacuous_lineage(self):
+        result = self.results['000826.SZ']
+        trades = [trade for trade in result['trades'] if trade['name'] == '二买']
+        self.assertTrue(trades, 'real-data positive gate must not be vacuous')
+        candidate_map = {
+            row['candidate_id']: row for row in result['audit_trace']['candidates']
+        }
+        trade_audit = trades[0]['audit']
+        child = candidate_map[trade_audit['candidate_id']]
+        source = candidate_map[trade_audit['source_b1_id']]
+        self.assertEqual('一买', source['buy_type'])
+        self.assertEqual('PASS', source['structure']['formal_first_buy_status'])
+        self.assertTrue(all(source['structure']['formal_first_buy']['invariants'].values()))
+        self.assertEqual(source['first_buy_provenance_id'],
+                         child['source_b1_provenance_id'])
+        self.assertEqual(source['first_buy_provenance_id'],
+                         child['first_buy_provenance_id'])
+        self.assertLessEqual(source['first_seen_at'], child['pullback_start_at'])
+        self.assertLess(child['pullback_start_at'], child['pullback_confirm_at'])
+        self.assertLessEqual(child['pullback_confirm_at'], trade_audit['decision_at'])
+        self.assertLess(trade_audit['decision_at'], trade_audit['fill_at'])
+        self.assertLessEqual(child['window_end'], source['window_end'])
+        adopted = next(
+            row for row in trade_audit['entry_predicates']
+            if row['candidate_id'] == trade_audit['candidate_id'])
+        self.assertTrue(adopted['predicates']['not_consumed'])
+
+    def test_002749_backfilled_fake_second_buy_is_absent(self):
+        result = self.results['002749.SZ']
+        self.assertFalse(any(trade['name'] == '二买' for trade in result['trades']))
+
+    def test_cross_period_adjustment_scale_is_bound_and_audited(self):
+        result = self.results['000810.SZ']
+        trades = [trade for trade in result['trades'] if trade['name'] == '二买']
+        self.assertTrue(trades, 'real-data scale fixture must retain a non-vacuous second buy')
+        candidate_map = {
+            row['candidate_id']: row for row in result['audit_trace']['candidates']
+        }
+        audit = trades[0]['audit']
+        child = candidate_map[audit['candidate_id']]
+        source = candidate_map[audit['source_b1_id']]
+        expected = {
+            'daily_price': 7.78,
+            'm30_price': 7.64157824,
+            'factor': 0.982208,
+            'ratio_spread': 1.1102230246251565e-16,
+            'at': '2024-07-09',
+        }
+        self.assertEqual(expected, source['daily_a_to_m30'])
+        self.assertEqual(expected, child['daily_a_to_m30'])
+        self.assertEqual(7.78, child['source_b1_daily_a_price'])
+        self.assertEqual(expected['m30_price'], child['abc']['A']['price'])
+        self.assertAlmostEqual(
+            expected['m30_price'] * 0.995,
+            audit['exit_predicates']['thresholds']['A_x_0_995'],
+        )
+
+
 if __name__ == '__main__':
     unittest.main()

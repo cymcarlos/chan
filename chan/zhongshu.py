@@ -34,6 +34,12 @@ class Zhongshu:
     end_dt: str
     occur_at: str = ''      # Phase R阶段3: 结构发生时间(第3笔结束)
     confirm_at: str = ''    # Phase R阶段3: 实际确认时间(第3笔确认)
+    member_start_idx: int = -1  # 在输入笔序列中的首成员索引
+    member_end_idx: int = -1    # 在输入笔序列中的末成员索引（含）
+    is_complete: bool = False   # 已有一笔离开当前重叠区，中心边界不再延伸
+    leave_confirm_at: str = ''  # 离开笔的确认时点；完整中枢的因果确认时间
+    initial_bounds: object = None  # 最初三笔形成时的ZD/ZG/DD/GG审计快照
+    member_bis: object = None      # 实际参与重叠/延伸的笔（只读审计引用）
 
     def __repr__(self):
         return f"ZS({self.sdir} zg={self.zg:.2f} zd={self.zd:.2f})"
@@ -103,6 +109,12 @@ def _build_zs(bi_list: List[Bi]) -> List[Zhongshu]:
         # 中枢方向由入口笔决定（进入重叠区的那笔），不是重叠区第一笔
         entry_bi = bi_list[i-1] if i > 0 else b0
         sdir = '向下' if entry_bi.direction == 'down' else '向上'
+        is_complete = j < len(bi_list)
+        leave_bi = bi_list[j] if is_complete else None
+        leave_confirm_at = ''
+        if leave_bi is not None:
+            leave_confirm_at = (getattr(leave_bi, 'confirm_at', '') or
+                                leave_bi.end_dt)
         zs = Zhongshu(
             zg=float(min(hs)), zd=float(max(ls)),  # P1:ZG/ZD用扩展后hs/ls
             gg=float(max(hs)), dd=float(min(ls)),
@@ -111,6 +123,16 @@ def _build_zs(bi_list: List[Bi]) -> List[Zhongshu]:
             end_dt=bi_list[j - 1].end_dt,
             occur_at=bi_list[i + 2].end_dt,
             confirm_at=bi_list[i + 2].get('confirm_at', bi_list[i + 2].end_dt) if hasattr(bi_list[i + 2], 'get') else (bi_list[i + 2].confirm_at or bi_list[i + 2].end_dt),
+            member_start_idx=i,
+            member_end_idx=j - 1,
+            is_complete=is_complete,
+            leave_confirm_at=leave_confirm_at,
+            initial_bounds={
+                'status': 'KNOWN',
+                'ZD': float(max(ls[:3])), 'ZG': float(min(hs[:3])),
+                'DD': float(min(ls[:3])), 'GG': float(max(hs[:3])),
+            },
+            member_bis=tuple(bi_list[i:j]),
         )
         zs_list.append(zs)
         i = j

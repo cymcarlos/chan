@@ -52,6 +52,18 @@ def _audit_stable_id(prefix, *parts):
     return f"{prefix}_{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:20]}"
 
 
+def _audit_iso_at(value):
+    """Normalize project date/datetime strings for causal comparisons."""
+    value = str(value or '')
+    if len(value) >= 19:
+        return value[:19]
+    if len(value) >= 16:
+        return value[:16] + ':00'
+    if len(value) >= 10:
+        return value[:10] + ' 00:00:00'
+    raise ValueError(f'invalid timestamp: {value!r}')
+
+
 def _audit_bi(bi, level):
     start_fx = getattr(bi, '_start_fx', None) or {}
     end_fx = getattr(bi, '_end_fx', None) or {}
@@ -78,6 +90,9 @@ def _audit_bi(bi, level):
 
 
 def _audit_zs(zs, level):
+    initial = getattr(zs, 'initial_bounds', None)
+    member_bis = list(getattr(zs, 'member_bis', None) or [])
+    member_ids = [_audit_bi(bi, level)['bi_id'] for bi in member_bis]
     return {
         'zhongshu_id': _audit_stable_id('zs', level, zs.sdir, zs.start_dt, zs.end_dt,
                                         repr(float(zs.zd)), repr(float(zs.zg))),
@@ -87,12 +102,18 @@ def _audit_zs(zs, level):
         'confirm_at': getattr(zs, 'confirm_at', '') or None,
         'ZD': float(zs.zd), 'ZG': float(zs.zg),
         'DD': float(zs.dd), 'GG': float(zs.gg),
-        # Zhongshu 当前没有保存“最初三笔”和延伸成员，不能反推伪造。
-        'initial_bounds': {'status': 'UNKNOWN', 'ZD': None, 'ZG': None,
-                           'DD': None, 'GG': None},
+        'is_complete': bool(getattr(zs, 'is_complete', False)),
+        'complete_at': getattr(zs, 'leave_confirm_at', '') or None,
+        'member_index_range': [getattr(zs, 'member_start_idx', -1),
+                               getattr(zs, 'member_end_idx', -1)],
+        'initial_bounds': (initial if initial is not None else {
+            'status': 'UNKNOWN', 'ZD': None, 'ZG': None, 'DD': None, 'GG': None}),
         'extended_bounds': {'status': 'KNOWN', 'ZD': float(zs.zd), 'ZG': float(zs.zg),
                             'DD': float(zs.dd), 'GG': float(zs.gg)},
-        'member_bi_ids': {'status': 'UNKNOWN', 'ids': []},
+        'member_bi_ids': {
+            'status': 'KNOWN' if member_bis else 'UNKNOWN',
+            'ids': member_ids,
+        },
     }
 
 
@@ -117,7 +138,7 @@ def _audit_candidate_structure(c):
         float(l2.zg) if l2 is not None else None)
     zd = float(c.zs_zd) if getattr(c, 'zs_zd', 0) else (
         float(l2.zd) if l2 is not None else None)
-    return {
+    result = {
         'engine_level': 'daily-pen proxy',
         'l2_zhongshu_id': (_audit_stable_id('l2zs', getattr(l2, 'idx', ''), l2.start_dt, l2.end_dt,
                                             repr(float(l2.zd)), repr(float(l2.zg)))
@@ -131,23 +152,40 @@ def _audit_candidate_structure(c):
                             'ZD': zd, 'ZG': zg,
                             'DD': l2_dd, 'GG': l2_gg},
     }
+    first_buy = getattr(c, 'first_buy_evidence', None)
+    if first_buy:
+        invariants = first_buy.get('invariants') or {}
+        result['formal_first_buy'] = first_buy
+        result['formal_first_buy_status'] = (
+            'PASS' if invariants and all(invariants.values()) else 'FAIL')
+    else:
+        result['formal_first_buy'] = None
+        result['formal_first_buy_status'] = 'NOT_APPLICABLE'
+    return result
 
 
-def _fresh_b1_alive(symbol: str, day_str: str, a_price: float, tol=0.01,
+def _fresh_b1_alive(symbol: str, asof_at: str, provenance_id: str,
                     audit_errors=None):
     """P1幽灵候选修复(2026-08-13): 链式活性校验。
 
     引擎候选"生成后留存不重校验", 结构漂移后已死的一买仍会借尸还魂链出二买
     (实证4笔: 000065#1/000058#1/000012#1 失败-26.78 + 000021 赢家+34.30)。
-    用完整重建的日K笔/中枢重扫, 验证源一买(A价±1%)是否仍存活。
-    仅在链式事件时触发(罕见), 每天每symbol至多重算一次; 校验异常时放行(保守)。
+    用完整重建的日K笔/中枢重扫，按冻结结构证据哈希精确验证源一买是否仍存活。
+    仅在链式事件时触发(罕见)，每天每symbol至多重算一次；校验异常时关闭来源，
+    禁止以不相关但A价接近的一买替代，也禁止异常静默放行。
     """
-    key = (symbol, day_str)
+    asof_dt = datetime.fromisoformat(_audit_iso_at(asof_at))
+    phase = 'closed' if asof_dt.time() >= datetime.strptime('15:00', '%H:%M').time() else 'prior'
+    key = (symbol, asof_dt.strftime('%Y-%m-%d'), phase)
     if key not in _FRESH_B1_CACHE:
         try:
             bars_d = load_daily(symbol)
-            sdt = datetime.strptime(day_str, '%Y-%m-%d')
-            avail = [b for b in bars_d if b.dt <= sdt]
+            avail = [
+                b for b in bars_d
+                if b.dt.date() < asof_dt.date()
+                or (b.dt.date() == asof_dt.date()
+                    and asof_dt.time() >= datetime.strptime('15:00', '%H:%M').time())
+            ]
             clear_level('D')
             bis = build_bi(avail, level='D')
             dc = [b.close for b in avail]
@@ -158,26 +196,31 @@ def _fresh_b1_alive(symbol: str, day_str: str, a_price: float, tol=0.01,
             # (否则陈旧一买借尸还魂通过A价±1%匹配, 幽灵校验形同虚设)
             _set = set()
             for c in cands:
-                if c.buy_type != '一买' or c.a_price <= 0:
+                evidence = getattr(c, 'first_buy_evidence', None) or {}
+                invariants = evidence.get('invariants') or {}
+                if (c.buy_type != '一买' or c.a_price <= 0
+                        or c.div_type != '趋势背驰'
+                        or not invariants or not all(invariants.values())):
                     continue
                 sig = c.signal_date[:10]
                 wend = min(c.window_end[:10],
                            (datetime.strptime(sig, "%Y-%m-%d") + timedelta(weeks=BUY1_WINDOW_WEEKS)).strftime("%Y-%m-%d"))
-                if sig <= day_str <= wend:
-                    _set.add(c.a_price)
+                asof_day = asof_dt.strftime('%Y-%m-%d')
+                if sig <= asof_day <= wend:
+                    pid = getattr(c, 'first_buy_provenance_id', '')
+                    if pid:
+                        _set.add(pid)
             _FRESH_B1_CACHE[key] = _set
         except Exception as exc:
-            _FRESH_B1_CACHE[key] = None
+            _FRESH_B1_CACHE[key] = set()
             if audit_errors is not None:
                 audit_errors.append({
-                    'at': day_str, 'stage': 'fresh_b1_alive',
+                    'at': asof_at, 'stage': 'fresh_b1_alive',
                     'error_type': type(exc).__name__, 'message': str(exc),
-                    'effect': 'source_b1_liveness=UNKNOWN; engine kept conservative pass-through',
+                    'effect': 'source_b1_liveness=UNKNOWN; entry blocked (fail closed)',
                 })
     s = _FRESH_B1_CACHE.get(key)
-    if s is None:
-        return True
-    return any(abs(p - a_price) / a_price < tol for p in s)
+    return bool(provenance_id and s is not None and provenance_id in s)
 
 
 def load_30min(symbol: str, conn=None):
@@ -705,47 +748,112 @@ def backtest_one(symbol: str, sdt="20260101", edt="20260804", conn=None,
             repr(float(getattr(source_zs, 'zg', 0) or 0)),
         )
 
+    def _formal_b1_source(c):
+        """Only a fully evidenced trend-divergence first buy may source a second buy."""
+        evidence = getattr(c, 'first_buy_evidence', None) or {}
+        invariants = evidence.get('invariants') or {}
+        provenance_id = getattr(c, 'first_buy_provenance_id', '')
+        return bool(
+            c.buy_type == '一买'
+            and c.div_type == '趋势背驰'
+            and invariants
+            and all(invariants.values())
+            and provenance_id
+            and evidence.get('provenance_id') == provenance_id
+            and float(getattr(c, '_a_price_m30', 0) or 0) > 0
+            and bool(getattr(c, '_daily_a_to_m30', None))
+        )
+
+    def _full_timestamp(value):
+        value = str(value or '')
+        if len(value) >= 19:
+            return value[:19]
+        if len(value) >= 16:
+            return value[:16] + ':00'
+        if len(value) >= 10:
+            return value[:10] + ' 00:00:00'
+        return ''
+
     # 审计是只写旁路：关闭时不创建/修改任何旧返回字段。
     audit_log = ({
         'schema_version': '1.0', 'symbol': symbol, 'status': 'OK',
         'candidate_events': [], 'decision_events': [], 'errors': [],
     } if audit_trace else None)
     audit_cands = {}       # candidate_id -> metadata
-    audit_obj_ids = {}     # id(BuyCandidate) -> candidate_id
-
     def _cand_id(c):
         source_zs = getattr(c, 'l2', None)
         return _audit_stable_id(
             'cand', symbol, c.buy_type, c.signal_date, c.a_date,
             repr(float(c.a_price or 0)), c.c_date, repr(float(c.c_price or 0)),
-            getattr(source_zs, 'start_dt', ''), getattr(source_zs, 'end_dt', ''),
-            repr(float(getattr(source_zs, 'zd', 0) or 0)),
-            repr(float(getattr(source_zs, 'zg', 0) or 0)))
+             getattr(source_zs, 'start_dt', ''), getattr(source_zs, 'end_dt', ''),
+             repr(float(getattr(source_zs, 'zd', 0) or 0)),
+             repr(float(getattr(source_zs, 'zg', 0) or 0)),
+             getattr(c, 'first_buy_provenance_id', ''))
 
     def _register_cand(c, seen_at, source=None, occur_at=None, confirm_at=None):
         if not audit_trace:
             return None
-        cid = audit_obj_ids.get(id(c)) or _cand_id(c)
-        audit_obj_ids[id(c)] = cid
-        source_id = audit_obj_ids.get(id(source)) if source is not None else None
-        if source is not None and source_id is None:
-            source_id = _register_cand(source, seen_at)
+        cid = getattr(c, '_audit_candidate_id', None) or _cand_id(c)
+        c._audit_candidate_id = cid
+        source_id = (_register_cand(source, seen_at)
+                     if source is not None else None)
         if cid not in audit_cands:
+            first_buy = getattr(c, 'first_buy_evidence', None)
+            raw_confirm_at = confirm_at or c.signal_date or None
+            structure_confirm_at = (
+                first_buy.get('B_complete_at') if first_buy else None)
+            effective_parts = [
+                _full_timestamp(value) for value in (
+                    raw_confirm_at, structure_confirm_at,
+                    getattr(c, '_source_b1_first_seen_at', None), seen_at)
+                if value
+            ]
+            effective_confirm_at = max(effective_parts) if effective_parts else None
+            if first_buy:
+                segs = first_buy.get('segments') or {}
+                macd_evidence = {
+                    'status': 'KNOWN',
+                    'A_area': (segs.get('A') or {}).get('area'),
+                    'C_area': (segs.get('C') or {}).get('area'),
+                    'lengths': {
+                        'A': (segs.get('A') or {}).get('length'),
+                        'C': (segs.get('C') or {}).get('length'),
+                    },
+                    'average_force': {
+                        'A': (segs.get('A') or {}).get('average_force'),
+                        'C': (segs.get('C') or {}).get('average_force'),
+                        'C_to_A_ratio': first_buy.get('average_force_ratio_C_to_A'),
+                        'threshold': 0.9,
+                    },
+                }
+            else:
+                macd_evidence = {
+                    'status': 'UNKNOWN', 'A_area': None, 'B_area': None,
+                    'C_area': None, 'lengths': None, 'average_force': None,
+                    'reason': 'candidate has no formal first-buy evidence',
+                }
             audit_cands[cid] = {
                 'candidate_id': cid, 'source_b1_id': source_id,
+                'first_buy_provenance_id': getattr(c, 'first_buy_provenance_id', None),
+                'source_b1_provenance_id': getattr(c, '_source_b1_provenance_id', None),
+                'daily_a_to_m30': getattr(c, '_daily_a_to_m30', None),
+                'source_b1_daily_a_price': getattr(c, '_source_b1_daily_a_price', None),
                 'buy_type': c.buy_type,
                 'occur_at': occur_at or c.c_date or c.a_date or c.signal_date or None,
-                'confirm_at': confirm_at or c.signal_date or None,
+                'confirm_at': raw_confirm_at,
+                'structure_confirm_at': structure_confirm_at,
+                'effective_confirm_at': effective_confirm_at,
                 'first_seen_at': seen_at,
+                'source_available_at': getattr(c, '_source_b1_first_seen_at', None),
+                'pullback_start_at': getattr(c, '_pullback_start_at', None),
+                'pullback_confirm_at': getattr(c, '_pullback_confirm_at', None),
                 'signal_at': c.signal_date or None, 'window_end': c.window_end or None,
                 'state': 'generated',
                 'abc': {
                     'A': {'at': c.a_date or None, 'price': float(c.a_price) if c.a_price else None},
                     'B': {'at': c.b_date or None, 'price': float(c.b_price) if c.b_price else None},
                     'C': {'at': c.c_date or None, 'price': float(c.c_price) if c.c_price else None},
-                    'macd': {'status': 'UNKNOWN', 'A_area': None, 'B_area': None,
-                             'C_area': None, 'lengths': None, 'average_force': None,
-                             'reason': 'BuyCandidate does not retain segment MACD evidence'},
+                    'macd': macd_evidence,
                     'divergence_type': c.div_type or None,
                 },
                 'structure': _audit_candidate_structure(c),
@@ -768,6 +876,26 @@ def backtest_one(symbol: str, sdt="20260101", edt="20260804", conn=None,
         if extra:
             item['evidence'] = extra
         audit_log['candidate_events'].append(item)
+
+    def _invalidate_source_chain(source, at, reason):
+        """Invalidate one first-buy source and every unconsumed child deterministically."""
+        source_key = (source.buy_type, source.signal_date)
+        source_pid = getattr(source, 'first_buy_provenance_id', '')
+        if audit_trace and source_key not in dead:
+            _cand_event(source, at, 'invalidated', 'invalidated', reason)
+        dead.add(source_key)
+        for child in candidates:
+            if (child.buy_type != '二买'
+                    or getattr(child, '_source_b1_provenance_id', '') != source_pid):
+                continue
+            child_key = (child.buy_type, child.signal_date)
+            if child_key in consumed:
+                continue
+            if audit_trace and child_key not in dead:
+                _cand_event(
+                    child, at, 'invalidated', 'invalidated',
+                    f'source first-buy invalidated: {reason}')
+            dead.add(child_key)
 
     def _decision_candidate(c, bar_, idx_, sub_bars_, diff_, dea_):
         """在入场决策时冻结所有候选的同口径谓词；异常显式为 UNKNOWN。"""
@@ -805,7 +933,7 @@ def backtest_one(symbol: str, sdt="20260101", edt="20260804", conn=None,
                 })
             elif c.buy_type == '二买':
                 A_, C_ = float(c.a_price or 0), float(c.c_price or c.a_price or 0)
-                cap_ = 1.05 if (c.div_type or '') == '盘整背驰' else 1.10
+                cap_ = 1.10
                 out['thresholds'] = {'A': A_ or None, 'C': C_ or None,
                                      'entry_cap_ratio': cap_, 'entry_cap': A_ * cap_ if A_ else None,
                                      'zone_low': C_ * .98 if C_ else None,
@@ -877,6 +1005,46 @@ def backtest_one(symbol: str, sdt="20260101", edt="20260804", conn=None,
         d_idx.setdefault(_x.dt.strftime('%Y-%m-%d'), _i)
     d_dates = [_x.dt.date() for _x in bars_d]
 
+    # 日线与30分钟数据可能使用不同复权尺度（实证000810：30m/日线=0.982208）。
+    # 二买所有30分钟价格谓词必须把日线A价转换到30分钟尺度；仅当同日OHLC四项
+    # 呈稳定比例时采用该比例，普通分笔/四舍五入差异保持1.0，证据不稳定则禁止链出二买。
+    daily_ohlc = {
+        item.dt.strftime('%Y-%m-%d'): (
+            float(item.open), float(item.high), float(item.low), float(item.close))
+        for item in bars_d
+    }
+    m30_ohlc = {}
+    for item in bars:
+        key_day = item.dt.strftime('%Y-%m-%d')
+        if key_day not in m30_ohlc:
+            m30_ohlc[key_day] = [
+                float(item.open), float(item.high), float(item.low), float(item.close)]
+        else:
+            agg = m30_ohlc[key_day]
+            agg[1] = max(agg[1], float(item.high))
+            agg[2] = min(agg[2], float(item.low))
+            agg[3] = float(item.close)
+
+    def _daily_a_to_m30(price, at_date):
+        daily_row = daily_ohlc.get(str(at_date or '')[:10])
+        m30_row = m30_ohlc.get(str(at_date or '')[:10])
+        if not daily_row or not m30_row or any(value <= 0 for value in daily_row):
+            return None
+        ratios = sorted(m30_row[i] / daily_row[i] for i in range(4))
+        factor = (ratios[1] + ratios[2]) / 2
+        if ratios[-1] - ratios[0] > 0.0025:
+            return None
+        # 小于0.5%的差异通常只是日/30分钟源的极值或分笔舍入差，不做虚假缩放。
+        if abs(factor - 1.0) <= 0.005:
+            factor = 1.0
+        return {
+            'daily_price': float(price),
+            'm30_price': float(price) * factor,
+            'factor': float(factor),
+            'ratio_spread': float(ratios[-1] - ratios[0]),
+            'at': str(at_date or '')[:10],
+        }
+
     m30_cursor = BiCursor()
     for _b in bars[:start_idx]:
         m30_cursor.update(_b)
@@ -922,6 +1090,31 @@ def backtest_one(symbol: str, sdt="20260101", edt="20260804", conn=None,
             p = pending
             pending = None
             if p['kind'] == 'entry':
+                source_ref = p.get('source_b1_ref')
+                if p.get('pname') == '二买':
+                    source_key = ((source_ref.buy_type, source_ref.signal_date)
+                                  if source_ref is not None else None)
+                    source_valid = bool(
+                        source_ref is not None
+                        and source_ref in candidates
+                        and source_key not in dead
+                        and day_str <= source_ref.window_end[:10]
+                        and getattr(source_ref, 'first_buy_provenance_id', '')
+                        == p.get('source_b1_provenance_id')
+                        and _fresh_b1_alive(
+                            symbol, bar.dt.strftime('%Y-%m-%d %H:%M:%S'),
+                            p.get('source_b1_provenance_id') or '',
+                            audit_errors=(audit_log['errors'] if audit_trace else None))
+                    )
+                    if not source_valid:
+                        if audit_trace:
+                            audit_log['decision_events'].append({
+                                'at': bar.dt.strftime('%Y-%m-%d %H:%M:%S'),
+                                'kind': 'entry_cancelled',
+                                'candidate_id': p.get('candidate_id'),
+                                'reason': 'source first-buy inactive or provenance changed before fill',
+                            })
+                        continue
                 pos = {
                     'name': p['pname'], 'entry_price': bar.open,
                     'entry_idx': idx,
@@ -946,6 +1139,8 @@ def backtest_one(symbol: str, sdt="20260101", edt="20260804", conn=None,
                         'source_b1_id': cand_meta.get('source_b1_id'),
                         'occur_at': cand_meta.get('occur_at'),
                         'confirm_at': cand_meta.get('confirm_at'),
+                        'structure_confirm_at': cand_meta.get('structure_confirm_at'),
+                        'effective_confirm_at': cand_meta.get('effective_confirm_at'),
                         'first_seen_at': cand_meta.get('first_seen_at'),
                         'decision_at': p.get('decision_at'), 'fill_at': fill_at,
                         'structure': p.get('structure'), 'abc_macd': cand_meta.get('abc'),
@@ -1060,10 +1255,28 @@ def backtest_one(symbol: str, sdt="20260101", edt="20260804", conn=None,
                         # 一买中阴边界(2026-08-11, 101课): 一买后BUY1_WINDOW_WEEKS内
                         # 才有二买(紧接的次级别回调); 之后中阴结束, 旧一买作废
                         if c.buy_type == '一买':
+                            conversion = _daily_a_to_m30(c.a_price, c.a_date or c.signal_date)
+                            if conversion is None:
+                                if audit_trace:
+                                    _cand_event(
+                                        c, audit_at, 'filtered', 'invalidated',
+                                        'daily/30-minute price scale could not be bound at source A')
+                                continue
+                            c._daily_a_to_m30 = conversion
+                            c._a_price_m30 = conversion['m30_price']
+                            if audit_trace:
+                                # The scanner candidate is registered before runtime filters so
+                                # rejected candidates remain auditable.  Refresh the fields that
+                                # are only known after the daily/30-minute scale binding; otherwise
+                                # the source B1 record incorrectly says the conversion is absent
+                                # while its derived B2 record contains it.
+                                cid = _register_cand(c, audit_at)
+                                audit_cands[cid]['daily_a_to_m30'] = dict(conversion)
                             wend = min(c.window_end[:10],
                                        (datetime.strptime(c.signal_date[:10], "%Y-%m-%d") + timedelta(weeks=BUY1_WINDOW_WEEKS)).strftime("%Y-%m-%d"))
                             c.window_end = wend
                         if source_update:
+                            c._first_seen_at = audit_at
                             # 同一背驰日后来确认了更近的中枢来源：消费前替换旧源，
                             # 并移除尚未消费、由旧源派生的二买，随后在本轮重新生成。
                             stale_children = [
@@ -1094,13 +1307,18 @@ def backtest_one(symbol: str, sdt="20260101", edt="20260804", conn=None,
                             continue
                         # 一买: 同类型保留最新signal(新信号作废旧信号, 49课)
                         if c.buy_type == '一买':
-                            if audit_trace:
-                                for old in candidates:
-                                    if old.buy_type == '一买' and old.signal_date < c.signal_date:
-                                        _cand_event(old, audit_at, 'superseded', 'invalidated',
-                                                    f'newer first-buy signal {c.signal_date}')
+                            older_sources = [
+                                old for old in candidates
+                                if old.buy_type == '一买'
+                                and old.signal_date < c.signal_date
+                            ]
+                            for old in older_sources:
+                                _invalidate_source_chain(
+                                    old, audit_at,
+                                    f'superseded by newer first-buy signal {c.signal_date}')
                             candidates = [x for x in candidates
                                           if not (x.buy_type == '一买' and x.signal_date < c.signal_date)]
+                        c._first_seen_at = audit_at
                         candidates.append(c)
                         cand_keys.add(key)
                         if audit_trace:
@@ -1112,12 +1330,16 @@ def backtest_one(symbol: str, sdt="20260101", edt="20260804", conn=None,
                     # 一段走势(笔级即可, 无需30min中枢); 一二买"紧接"(中阴状态内)
                     # (2026-08-11 修改: trend版[需30min中枢]错过首次浅回调, 信号延迟60-229天)
                     ym_active = [x for x in candidates
-                                 if x.buy_type == '一买' and x.signal_date[:10] <= day_str
+                                 if _formal_b1_source(x) and x.signal_date[:10] <= day_str
                                  and day_str <= x.window_end[:10]          # 中阴边界(BUY1_WINDOW_WEEKS)
                                  and (x.buy_type, x.signal_date) not in dead]
                     if ym_active:
                         ym = max(ym_active, key=lambda x: x.signal_date)
                         ym_end = (ym.a_date or ym.signal_date)[:10]
+                        source_available_at = _full_timestamp(
+                            getattr(ym, '_first_seen_at', None)
+                            or (getattr(ym, 'first_buy_evidence', {}) or {}).get('B_complete_at')
+                            or ym_end)
                         bis30 = m30_cursor.bis
                         # A: 一买后第一次"合格"次级别回调(向下笔, 101课"回抽结束后再次
                         # 探底或回试的那个次级别走势的结束点"; 笔级即可无需中枢)
@@ -1129,10 +1351,16 @@ def backtest_one(symbol: str, sdt="20260101", edt="20260804", conn=None,
                         #  vs 1.05-1.10组55%; C/A=1.14的二买实为"8周后新下跌"追高单)
                         first_pb = None
                         last_pb = None
-                        if ym.a_price > 0:
+                        source_a_m30 = float(getattr(ym, '_a_price_m30', 0) or 0)
+                        if source_a_m30 > 0:
                             for _i, _bi in enumerate(bis30):
-                                if _bi.direction == 'down' and _bi.start_dt[:10] >= ym_end:
-                                    if ym.a_price * 0.90 <= _bi.low <= ym.a_price * 1.08:
+                                pullback_start_at = _full_timestamp(_bi.start_dt)
+                                pullback_confirm_at = _full_timestamp(
+                                    getattr(_bi, 'confirm_at', '') or _bi.end_dt)
+                                if (_bi.direction == 'down'
+                                        and pullback_start_at >= source_available_at
+                                        and pullback_confirm_at > source_available_at):
+                                    if source_a_m30 * 0.90 <= _bi.low <= source_a_m30 * 1.08:
                                         if first_pb is None:
                                             first_pb = (_bi, _i)
                                         last_pb = (_bi, _i)
@@ -1145,15 +1373,14 @@ def backtest_one(symbol: str, sdt="20260101", edt="20260804", conn=None,
                                 # P1幽灵候选修复(2026-08-13): 链式活性校验 —
                                 # 源一买在完整重建重扫中已不存在 → 一买作废, 不链二买
                                 # (实证: 3失败-26.78+1赢家+34.30; 000062源一买存活不受影响)
-                                _alive = (ym.a_price <= 0) or _fresh_b1_alive(
-                                    symbol, day_str, ym.a_price,
+                                _alive = _fresh_b1_alive(
+                                    symbol, bar.dt.strftime('%Y-%m-%d %H:%M:%S'),
+                                    ym.first_buy_provenance_id,
                                     audit_errors=(audit_log['errors'] if audit_trace else None))
                                 if not _alive:
-                                    if audit_trace and (ym.buy_type, ym.signal_date) not in dead:
-                                        _cand_event(ym, bar.dt.strftime('%Y-%m-%d %H:%M:%S'),
-                                                    'invalidated', 'invalidated',
-                                                    'fresh rebuild no longer contains source first-buy')
-                                    dead.add((ym.buy_type, ym.signal_date))
+                                    _invalidate_source_chain(
+                                        ym, bar.dt.strftime('%Y-%m-%d %H:%M:%S'),
+                                        'fresh rebuild no longer contains exact source provenance')
                                 key2 = ('二买', sig_dt)
                                 if _alive and key2 not in consumed and key2 not in dead:
                                     exist = next((c for c in candidates
@@ -1162,12 +1389,25 @@ def backtest_one(symbol: str, sdt="20260101", edt="20260804", conn=None,
                                         bounce = bis30[pb_i - 1] if pb_i > 0 else None
                                         b2 = BuyCandidate(
                                             buy_type='二买', signal_date=sig_dt,
-                                            window_end=(datetime.strptime(sig_dt, "%Y-%m-%d") + timedelta(weeks=SIGNAL_WINDOW_WEEKS)).strftime("%Y-%m-%d"),
-                                            l2=ym.l2, a_price=ym.a_price, a_date=ym.a_date,
+                                            window_end=min(
+                                                (datetime.strptime(sig_dt, "%Y-%m-%d") + timedelta(weeks=SIGNAL_WINDOW_WEEKS)).strftime("%Y-%m-%d"),
+                                                ym.window_end[:10]),
+                                            l2=ym.l2, a_price=source_a_m30, a_date=ym.a_date,
                                             b_price=(bounce.high if bounce else pb.low),
                                             b_date=(bounce.end_dt[:10] if bounce else sig_dt),
                                             c_price=pb.low, c_date=pb.end_dt[:10],
                                             div_type=ym.div_type)   # P1-1(2026-08-13): 传承一买源类型
+                                        b2.first_buy_evidence = ym.first_buy_evidence
+                                        b2.first_buy_provenance_id = ym.first_buy_provenance_id
+                                        b2._source_b1_provenance_id = ym.first_buy_provenance_id
+                                        b2._source_b1_ref = ym
+                                        b2._source_b1_daily_a_price = float(ym.a_price)
+                                        b2._daily_a_to_m30 = dict(ym._daily_a_to_m30)
+                                        b2._source_b1_first_seen_at = source_available_at
+                                        b2._pullback_start_at = _full_timestamp(pb.start_dt)
+                                        b2._pullback_confirm_at = _full_timestamp(
+                                            getattr(pb, 'confirm_at', '') or pb.end_dt)
+                                        b2._first_seen_at = bar.dt.strftime('%Y-%m-%d %H:%M:%S')
                                         b2._source_b1_slot = (ym.buy_type, ym.signal_date)
                                         b2._source_b1_rank = _b1_source_rank(ym)
                                         candidates.append(b2)
@@ -1199,15 +1439,26 @@ def backtest_one(symbol: str, sdt="20260101", edt="20260804", conn=None,
         # ── 结构破坏跟踪 ──
         for c in candidates:
             key = (c.buy_type, c.signal_date)
-            if key in dead or day_str < c.signal_date[:10]:
+            if key in dead:
+                continue
+            if c.buy_type == '一买' and day_str > c.window_end[:10]:
+                _invalidate_source_chain(
+                    c, bar.dt.strftime('%Y-%m-%d %H:%M:%S'),
+                    'source first-buy window expired')
+                continue
+            if day_str < c.signal_date[:10]:
                 continue
             if c.buy_type == '一买' and c.a_price > 0:
-                if bar.low < c.a_price * 0.995:
-                    if audit_trace and key not in dead:
-                        _cand_event(c, bar.dt.strftime('%Y-%m-%d %H:%M:%S'),
-                                    'invalidated', 'invalidated', 'bar low broke A*0.995',
-                                    {'bar_low': float(bar.low), 'threshold': float(c.a_price * .995)})
-                    dead.add(key)
+                source_a_m30 = float(getattr(c, '_a_price_m30', 0) or 0)
+                if not source_a_m30:
+                    _invalidate_source_chain(
+                        c, bar.dt.strftime('%Y-%m-%d %H:%M:%S'),
+                        'source first-buy has no bound daily/30-minute price scale')
+                elif bar.low < source_a_m30 * 0.995:
+                    _invalidate_source_chain(
+                        c, bar.dt.strftime('%Y-%m-%d %H:%M:%S'),
+                        f'bar low {float(bar.low)} broke scaled A*0.995 '
+                        f'{float(source_a_m30 * .995)}')
             elif c.buy_type == '二买' and c.a_price > 0:
                 if bar.low < c.a_price * 0.995:
                     if audit_trace and key not in dead:
@@ -1473,6 +1724,7 @@ def backtest_one(symbol: str, sdt="20260101", edt="20260804", conn=None,
             active.sort(key=lambda x: priority.get(x.buy_type, 9))
             sub_bars = bars[:idx+1]
             fired = False
+            pre_consumption_snapshots = None
 
             for bc in active:
                 if bc.buy_type == '三买':
@@ -1543,6 +1795,28 @@ def backtest_one(symbol: str, sdt="20260101", edt="20260804", conn=None,
                     entry_zg = 0; entry_a = ref_a; entry_b = 0
 
                 elif bc.buy_type == '二买':
+                    source_ref = getattr(bc, '_source_b1_ref', None)
+                    source_key = ((source_ref.buy_type, source_ref.signal_date)
+                                  if source_ref is not None else None)
+                    if (source_ref is None or source_ref not in candidates
+                            or source_key in dead
+                            or day_str > source_ref.window_end[:10]
+                            or getattr(source_ref, 'first_buy_provenance_id', '')
+                            != getattr(bc, '_source_b1_provenance_id', '')):
+                        continue
+                    evidence = getattr(bc, 'first_buy_evidence', None) or {}
+                    invariants = evidence.get('invariants') or {}
+                    if (bc.div_type != '趋势背驰' or not invariants
+                            or not all(invariants.values())):
+                        continue
+                    source_available_at = _full_timestamp(
+                        getattr(bc, '_source_b1_first_seen_at', ''))
+                    if (not source_available_at
+                            or _full_timestamp(getattr(bc, '_pullback_start_at', ''))
+                            < source_available_at
+                            or _full_timestamp(getattr(bc, '_pullback_confirm_at', ''))
+                            <= source_available_at):
+                        continue
                     if bc.a_price <= 0:
                         continue
                     key = (bc.buy_type, bc.signal_date)
@@ -1550,10 +1824,8 @@ def backtest_one(symbol: str, sdt="20260101", edt="20260804", conn=None,
                     C = bc.c_price or A
                     # (2026-08-12, 胜率分析建议2③): 入场执行价≤A×1.10 —
                     # 入场/A≥1.10组胜率明显低于1.05-1.10组(追高单7笔止损全部≥1.10)
-                    # P1-3双条件(2026-08-13, 选项1): 盘整背驰源二买收紧至≤A×1.05
-                    # (27课弱前提+追高双重弱; 审计: 盘整背驰源失败单入场比1.078/1.094);
-                    # 趋势背驰源保持1.10(000062入场/A=1.09是最大赢家, 不伤)
-                    _cap = 1.05 if (bc.div_type or '') == '盘整背驰' else 1.10
+                    # 正式二买只允许趋势背驰一买来源；入场执行价≤A×1.10。
+                    _cap = 1.10
                     if cur > A * _cap:
                         continue
                     in_a_zone = C * 0.98 <= cur <= C * 1.05
@@ -1578,6 +1850,11 @@ def backtest_one(symbol: str, sdt="20260101", edt="20260804", conn=None,
                     entry_zg = 0; entry_a = A; entry_b = bc.b_price
 
                 if fired:
+                    if audit_trace:
+                        pre_consumption_snapshots = [
+                            _decision_candidate(x, bar, idx, sub_bars, diff, dea)
+                            for x in active
+                        ]
                     consumed.add((bc.buy_type, bc.signal_date))
                     in_zone.pop((bc.buy_type, bc.signal_date), None)
                     if audit_trace:
@@ -1589,12 +1866,14 @@ def backtest_one(symbol: str, sdt="20260101", edt="20260804", conn=None,
                 pending = {'kind': 'entry', 'pname': pname,
                            'entry_a': entry_a, 'entry_b': entry_b,
                            'entry_zg': entry_zg,
-                           'div_type': bc.div_type or ''}
+                           'div_type': bc.div_type or '',
+                           'source_b1_ref': getattr(bc, '_source_b1_ref', None),
+                           'source_b1_provenance_id': getattr(
+                               bc, '_source_b1_provenance_id', None)}
                 if audit_trace:
                     decision_at = bar.dt.strftime('%Y-%m-%d %H:%M:%S')
                     adopted_id = _register_cand(bc, decision_at)
-                    snapshots = [_decision_candidate(x, bar, idx, sub_bars, diff, dea)
-                                 for x in active]
+                    snapshots = pre_consumption_snapshots or []
                     for snap in snapshots:
                         snap['actual_reason'] = (
                             f'adopted by priority and all engine predicates passed ({pname})'

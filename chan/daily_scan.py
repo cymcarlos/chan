@@ -5,13 +5,16 @@
   - load_daily:        日K数据加载(缓存)
   - clear_daily_cache: 清缓存
   - scan_daily:        日线 L1笔中枢 买点扫描
-      * 一买: 两个连续向下日线笔中枢 + ZG下移 + 背驰点创新低 + MACD面积背驰
+      * 一买: 两个相邻、完整、同向下日线笔中枢 + ZG2<ZD1中心区间下移
+              + C段创新低 + MACD面积趋势背驰
       * 三买: 向上日线笔中枢 + 离开ZG + 回试不破ZG
       * 二买: 不在日K层生成(课本p37: 二买=一买后第一次【次级别】回调,
               操作级别=日K时次级别=30min, 由30min介入层确认)
   前视偏差修复(2026-08-06): edt截断——扫描只能用edt之前的数据。
 """
 
+import hashlib
+import json
 import sqlite3
 from datetime import datetime
 
@@ -69,15 +72,16 @@ def scan_daily_on_bis(bis, bars, diff, dea, d_idx=None):
 
     clear_level('D')
     all_zs_L1 = build_zs(bis, level='D')
-    if len(all_zs_L1) < 3:
+    if len(all_zs_L1) < 2:
         return []
 
     # 窄中枢过滤(2026-08-06): 区间宽度 < 0.3% 的中枢是"多笔共同重叠"的数学产物
     # (如 [20.97,20.99]=0.1%), 操作意义≈0; 但 0.5%~1.5% 的窄中枢在低价股/低波动股
     # 上是真实窄幅整理(000537 一买中枢对 0.5%/1.4%), 不能一刀切滤掉
     zs_L1 = [z for z in all_zs_L1 if z.zg > z.zd * 1.003]
-    if len(zs_L1) < 3:
+    if len(zs_L1) < 2:
         return []
+    allow_third_buy = len(zs_L1) >= 3  # 保持三买原有“至少三个有效中枢”门槛
 
     # L2(周线级)背景方向(Phase4, 49课"没必要参与操作级别及以上级别的下跌"):
     # 日K操作级别的上级=周线级=日K-L2中枢(3个日K走势重叠)。
@@ -106,23 +110,60 @@ def scan_daily_on_bis(bis, bars, diff, dea, d_idx=None):
     candidates = []
     b1_by_signal = {}
 
-    # ── 一买: 相邻向下中枢对 + ZG下移 + 平均力度背驰(15/24/37课) ──
-    # (2026-08-07 课本修正:
-    #  ① 中枢对: 相邻向下中枢(中间可隔向上中枢, 20课"逐级下移"的大级别下跌)
-    #  ② 判据: b.zg<a.zd(ZG下移) + 平均力度背驰(15课"趋势平均力度"=面积/时间)
-    #  ③ 两类候选:
-    #     - 趋势背驰: c段创新低(c_low<b.dd, 37课) → A=c段低点(当下背驰点)
-    #     - 盘整背驰: c段未创新低(27课, 低位由入场层把关) → A=b.dd(中枢内低点,
-    #       时点稳定不漂移; 000423二买依赖此信号)
-    #  ④ sig=背驰点日(101课"一买就是背驰点"), 窗口52周(旧信号复活源))
-    downs = [z for z in zs_L1 if z.sdir == '向下']
-    # 候选可过滤无操作意义的窄中枢，但结构边界必须使用完整中枢序列；
-    # 否则旧C段仍可能跨过一个被过滤的窄中枢，重新绑定后续低点。
-    all_zs_pos = {id(z): i for i, z in enumerate(all_zs_L1)}
-    for i in range(len(downs) - 1):
-        a, b = downs[i], downs[i + 1]
+    # ── 一买: 两个相邻完整向下中枢 + 中心区间下移 + C创新低 + 趋势背驰 ──
+    # 正式口径:
+    #  ① A/B必须在原始同级中枢序列中直接相邻；不能跳过向上或窄中枢配对。
+    #  ② 两者均已确认，且 B.ZG < A.ZD（108课的两个中枢区间不重叠）。
+    #     更严格的 B.GG < A.DD 作为诊断项报告，不作为课本硬门槛。
+    #  ③ C严格从B结束后的第一根日K开始，并在下一个原始同级中枢前截止。
+    #  ④ C必须相对B.DD创新低，且MACD平均力度背驰；盘整背驰不生成正式一买。
+    eligible_zs_ids = {id(z) for z in zs_L1}
+
+    def _complete_zs(z):
+        """中枢已由后续离开笔封闭，且其确认时点落在当前日K前缀内。"""
+        start_i = d_idx.get(z.start_dt[:10])
+        end_i = d_idx.get(z.end_dt[:10])
+        if not getattr(z, 'is_complete', False):
+            return None
+        confirm_at = getattr(z, 'leave_confirm_at', '') or ''
+        confirm_i = d_idx.get(confirm_at[:10]) if confirm_at else None
+        if start_i is None or end_i is None or confirm_i is None:
+            return None
+        if not (start_i <= end_i < len(bars) and confirm_i < len(bars)):
+            return None
+        return confirm_i
+
+    def _zs_evidence(z):
+        """冻结正式一买所用中枢字段；不把可变对象引用写入审计证据。"""
+        return {
+            'direction': z.sdir,
+            'start_at': z.start_dt,
+            'end_at': z.end_dt,
+            'occur_at': getattr(z, 'occur_at', '') or None,
+            'initial_confirm_at': getattr(z, 'confirm_at', '') or None,
+            'complete_at': getattr(z, 'leave_confirm_at', '') or None,
+            'member_start_idx': getattr(z, 'member_start_idx', -1),
+            'member_end_idx': getattr(z, 'member_end_idx', -1),
+            'is_complete': bool(getattr(z, 'is_complete', False)),
+            'ZD': float(z.zd), 'ZG': float(z.zg),
+            'DD': float(z.dd), 'GG': float(z.gg),
+        }
+
+    # 候选宽度过滤与结构相邻/边界判定分离：后两者必须使用未过滤序列。
+    for b_zs_i in range(1, len(all_zs_L1)):
+        a, b = all_zs_L1[b_zs_i - 1], all_zs_L1[b_zs_i]
+        if id(a) not in eligible_zs_ids or id(b) not in eligible_zs_ids:
+            continue
+        if a.sdir != '向下' or b.sdir != '向下':
+            continue
+        if getattr(a, 'member_start_idx', -1) <= 0:
+            continue   # 数据前缀首中枢没有真实进入笔，方向不可用于正式一买
+        a_confirm_i = _complete_zs(a)
+        b_confirm_i = _complete_zs(b)
+        if a_confirm_i is None or b_confirm_i is None:
+            continue
         if b.zg >= a.zd:
-            continue   # ZG未下移(20课中心定理二: 需逐级下移)
+            continue   # 中心区间未下移，不能构成两个下降中枢的趋势
         # A段: a.start前60根摆动高点 → a.start
         a_s0 = _bar_idx(a.start_dt)
         hi = a_s0
@@ -135,9 +176,7 @@ def scan_daily_on_bis(bis, bars, diff, dea, d_idx=None):
         # C段: b.end之后离开b中枢的段(到c低点)。若其后已经形成新的同级
         # 中枢，C段必须在新中枢开始前截止；不能让历史b中枢跨过后续中枢，
         # 重新绑定到多年后的新低点。
-        b_s = _bar_idx(b.start_dt)
         b_e = _bar_idx(b.end_dt)
-        b_zs_i = all_zs_pos[id(b)]
         if b_zs_i + 1 < len(all_zs_L1):
             next_zs_start = _bar_idx(all_zs_L1[b_zs_i + 1].start_dt)
             c_sub = bars[b_e + 1:max(b_e + 1, next_zs_start)]
@@ -148,22 +187,28 @@ def scan_daily_on_bis(bis, bars, diff, dea, d_idx=None):
         min_bar = min(c_sub, key=lambda x: x.low)
         c_low = min_bar.low
         c_low_i = b_e + 1 + c_sub.index(min_bar)
-        area_C = macd_area(diff, dea, b_e, c_low_i, 'down')
+        if b_confirm_i > c_low_i or c_low >= b.dd:
+            continue   # B尚未确认，或C没有相对B.DD创新低
+        c_confirm_bis = [
+            bi for bi in bis
+            if bi.direction == 'down'
+            and bi.end_dt[:10] == min_bar.dt.strftime('%Y-%m-%d')
+            and abs(float(bi.end_price) - float(c_low)) <= max(abs(c_low), 1.0) * 1e-9
+            and getattr(bi, 'confirm_at', '')
+        ]
+        if not c_confirm_bis:
+            continue   # C低点必须是已确认向下笔终点，不能使用仍会漂移的临时最低价
+        c_low_confirm_at = max(bi.confirm_at for bi in c_confirm_bis)
+        c_confirm_i = d_idx.get(c_low_confirm_at[:10])
+        if c_confirm_i is None or c_confirm_i >= len(bars):
+            continue
+        area_C = macd_area(diff, dea, b_e + 1, c_low_i, 'down')
         len_A = max(a_s0 - hi, 1); len_C = max(c_low_i - b_e, 1)
         if area_A < 0 and area_C < 0 and \
                 abs(area_C) / len_C < abs(area_A) / len_A * 0.9:
-            if c_low < b.dd * 0.999:
-                # 趋势背驰: A=c段低点(当下背驰点)
-                div_type = '趋势背驰'
-                a_low = min_bar.low
-                a_date = min_bar.dt.strftime("%Y-%m-%d")
-            else:
-                # 盘整背驰: A=b中枢内低点(时点稳定)
-                div_type = '盘整背驰'
-                b_sub = bars[b_s:b_e + 1]
-                min_b = min(b_sub, key=lambda x: x.low) if b_sub else min_bar
-                a_low = min_b.low
-                a_date = min_b.dt.strftime("%Y-%m-%d")
+            div_type = '趋势背驰'
+            a_low = min_bar.low
+            a_date = min_bar.dt.strftime("%Y-%m-%d")
             # sig=背驰点日(101课), 窗口52周
             sig = a_date
             candidate = BuyCandidate(
@@ -171,6 +216,71 @@ def scan_daily_on_bis(bis, bars, diff, dea, d_idx=None):
                 window_end=_add_weeks(sig, 52),
                 l2=b, a_price=a_low, a_date=a_date, div_type=div_type,
                 weekly_dir=l2_dir)
+            avg_A = abs(area_A) / len_A
+            avg_C = abs(area_C) / len_C
+            next_center_at = (
+                all_zs_L1[b_zs_i + 1].start_dt
+                if b_zs_i + 1 < len(all_zs_L1) else None)
+            # 运行时审计旁路：BuyCandidate dataclass与旧序列化字段均不变化。
+            evidence = {
+                'schema_version': 'formal-first-buy/v1',
+                'centers': {
+                    'A': _zs_evidence(a),
+                    'B': _zs_evidence(b),
+                },
+                'raw_center_indices': {'A': b_zs_i - 1, 'B': b_zs_i},
+                'segments': {
+                    'A': {
+                        'start_at': bars[hi].dt.strftime("%Y-%m-%d"),
+                        'end_at': bars[a_s0].dt.strftime("%Y-%m-%d"),
+                        'area': float(area_A), 'length': len_A,
+                        'average_force': float(avg_A),
+                    },
+                    'C': {
+                        'start_at': bars[b_e + 1].dt.strftime("%Y-%m-%d"),
+                        'end_at': a_date,
+                        'low_at': a_date, 'low': float(c_low),
+                        'low_confirm_at': c_low_confirm_at,
+                        'area': float(area_C), 'length': len_C,
+                        'average_force': float(avg_C),
+                        'next_center_start_at': next_center_at,
+                    },
+                },
+                'average_force_ratio_C_to_A': (
+                    float(avg_C / avg_A) if avg_A else None),
+                'B_complete_at': getattr(b, 'leave_confirm_at', '') or None,
+                'invariants': {
+                    'adjacent_in_raw_center_sequence': True,
+                    'same_direction_down': a.sdir == b.sdir == '向下',
+                    'both_centers_width_eligible': (
+                        id(a) in eligible_zs_ids and id(b) in eligible_zs_ids),
+                    'A_complete': bool(getattr(a, 'is_complete', False)),
+                    'B_complete': bool(getattr(b, 'is_complete', False)),
+                    'A_has_real_entry_pen': getattr(a, 'member_start_idx', -1) > 0,
+                    'center_interval_downshift_ZG2_lt_ZD1': b.zg < a.zd,
+                    'B_confirmed_by_C_low': b_confirm_i <= c_low_i,
+                    'C_starts_after_B_end': b_e + 1 > b_e,
+                    'C_low_before_next_center': (
+                        next_center_at is None or c_low_i < next_zs_start),
+                    'C_makes_new_low_below_B_DD': c_low < b.dd,
+                    'C_low_is_confirmed_down_pen_end': bool(c_confirm_bis),
+                    'C_low_confirmed_in_available_prefix': c_confirm_i < len(bars),
+                    'A_and_C_have_down_macd_area': area_A < 0 and area_C < 0,
+                    'C_average_force_lt_A_x_0_9': avg_C < avg_A * 0.9,
+                    'trend_divergence_only': div_type == '趋势背驰',
+                },
+                'diagnostics': {
+                    'strong_full_range_isolation_GG2_lt_DD1': b.gg < a.dd,
+                    'full_range_overlap': not (b.gg < a.dd),
+                },
+            }
+            canonical = json.dumps(
+                evidence, ensure_ascii=False, sort_keys=True,
+                separators=(',', ':'), allow_nan=False).encode('utf-8')
+            provenance_id = 'b1prov_' + hashlib.sha256(canonical).hexdigest()[:24]
+            evidence['provenance_id'] = provenance_id
+            candidate.first_buy_evidence = evidence
+            candidate.first_buy_provenance_id = provenance_id
             # 同一背驰点若仍被多个结构解释，只保留结束时间最近的中枢来源。
             # 外层交易引擎仍按(买点类型, signal_date)消费，避免同一买点重复交易。
             previous = b1_by_signal.get(sig)
@@ -181,7 +291,7 @@ def scan_daily_on_bis(bis, bars, diff, dea, d_idx=None):
     candidates.extend(b1_by_signal.values())
 
     # ── 三买: 向上日线笔中枢(L1) + 离开ZG + 回试不破ZG ──
-    for l2 in zs_L1:
+    for l2 in (zs_L1 if allow_third_buy else []):
         if l2.sdir != '向上':
             continue
         end_idx = _bar_idx(l2.end_dt)
