@@ -6,7 +6,7 @@
 
 构建: 周线K线 → 周线笔(level='W') → 周线笔中枢 → 最近走势方向。
 
-⚠️ 算法文档: /root/data/backtest/ALGORITHM.md (第3.4节)
+⚠️ 算法文档: 仓库根 ALGORITHM.md (第3.4节)
    修改影响算法时必须同步更新 ALGORITHM.md。
 """
 import os
@@ -17,12 +17,11 @@ from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from chan.paths import DB_PATH
 from chan.bars import RawBar
 from chan.state import clear_level
 from chan.bi import build_bi
 from chan.zhongshu import build_zs
-
-DB_PATH = '/root/data/backtest/kline.db'
 
 
 def load_weekly(symbol: str, conn=None) -> list:

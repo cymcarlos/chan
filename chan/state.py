@@ -6,7 +6,7 @@ bi.py 和 zhongshu.py 原先用全局 dict keyed by symbol，导致同 symbol
 60min 管线中: 同一进程内逐股回测时必须调用 clear_all() 清缓存,
 避免上一只股票的笔/中枢状态串到下一只。
 
-⚠️ 算法文档: /root/data/backtest/ALGORITHM.md (第2.5节)
+⚠️ 算法文档: 仓库根 ALGORITHM.md (第2.5节)
    修改影响算法时必须同步更新 ALGORITHM.md。
 """
 

@@ -6,7 +6,7 @@
 
 已验证: 000333.SZ 57个L1中枢 → 30个走势类型 → 24个L2中枢 → 1一买/9二买/3三买
 
-⚠️ 算法文档: /root/data/backtest/ALGORITHM.md (第3.1节)
+⚠️ 算法文档: 仓库根 ALGORITHM.md (第3.1节)
    修改影响算法时必须同步更新 ALGORITHM.md。
 """
 
@@ -14,13 +14,13 @@ import sqlite3
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 from typing import List, Optional
+from chan.paths import DB_PATH
 from chan.bars import RawBar, macd, macd_area
 from chan.bi import build_bi
 from chan.zhongshu import build_zs, Zhongshu
 from chan.confirm_60min import load_60min
 from chan.state import clear_level
 
-DB_PATH = '/root/data/backtest/kline.db'
 CACHE_VERSION = 1
 
 

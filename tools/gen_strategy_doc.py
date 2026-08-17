@@ -5,12 +5,13 @@
    + 规则参数 + 三年回测结果。自包含(内嵌echarts.min.js)。
 """
 import sys, os, json, sqlite3
-sys.path.insert(0, '/root/data/backtest')
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from datetime import datetime, timedelta
 
+from chan.paths import DB_PATH, PROJECT_ROOT
 import gen_30min_chart as gc
 
-OUT = '/root/data/backtest/charts/策略说明书.html'
+OUT = os.path.join(PROJECT_ROOT, 'charts', '策略说明书.html')
 ECHARTS = gc.ECHARTS_JS
 
 # 案例: (sym, 标题, 描述, 结果文件年份)
@@ -31,7 +32,7 @@ CASES = [
 
 
 def load_trades(year):
-    r = json.load(open(f'/root/data/backtest/results/bt_full30_{year}.json'))
+    r = json.load(open(os.path.join(PROJECT_ROOT, 'results', f'bt_full30_{year}.json')))
     out = {}
     for bt, ts in r.items():
         for t in ts:
@@ -55,7 +56,7 @@ def concept_schemas():
     from chan.bars import macd, macd_area
     from chan.daily_scan import load_daily
 
-    conn = sqlite3.connect('/root/data/backtest/kline.db', timeout=60)
+    conn = sqlite3.connect(DB_PATH, timeout=60)
     bars = load_daily('000537.SZ', conn=conn)
     conn.close()
     clear_all()

@@ -12,13 +12,14 @@
                        / 结构止损(A/ZG) / 止损10%兜底 (移动止盈已删除)
 """
 
-import hashlib, sqlite3, time, sys
+import hashlib, sqlite3, time, sys, os
 from bisect import bisect_left, bisect_right
 from datetime import datetime, timedelta
 from collections import defaultdict
 
-sys.path.insert(0, '/root/data/backtest')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from chan.paths import DB_PATH
 from chan.bars import RawBar, macd, macd_area
 from chan.bi import build_bi, BiCursor
 from chan.zhongshu import build_zs
@@ -27,8 +28,6 @@ from chan.scanner_60min import (BuyCandidate, build_trends, _add_weeks)
 from chan.backtest_60min import (_find_bottom_fractal_idx, _is_recovering,
                                  _divergence_at_fractal)
 from chan.daily_scan import scan_daily, scan_daily_on_bis, scan_daily_on_bars, load_daily, clear_daily_cache
-
-DB_PATH = '/root/data/backtest/kline.db'
 USE_30M_SWING = False   # A/B: 关(干净口径对照)
                        # (原False: 全仓清仓式短差破坏趋势股; 现保留pnl>3%+60根门限+回补机制,
                        #  验证"先浮盈后亏"单能否被30min一卖/二卖救出, 以及回补是否对冲卖飞)

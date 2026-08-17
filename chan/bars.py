@@ -3,7 +3,7 @@
 
 完全自实现，零外部依赖。对照 CZSC 源码和 108 课标准。
 
-⚠️ 算法文档: /root/data/backtest/ALGORITHM.md (第2.1节)
+⚠️ 算法文档: 仓库根 ALGORITHM.md (第2.1节)
    修改影响算法时必须同步更新 ALGORITHM.md。
 """
 

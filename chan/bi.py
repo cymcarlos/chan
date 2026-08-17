@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """笔的构建 — 顶底交替。Ch62-65。自实现，算法逻辑复刻 CZSC。
 
-⚠️ 算法文档: /root/data/backtest/ALGORITHM.md (第2.3节)
+⚠️ 算法文档: 仓库根 ALGORITHM.md (第2.3节)
    修改影响算法时必须同步更新 ALGORITHM.md。
    笔破坏回退是 CZSC 官方注释点名的易错处, 改动需对比 czsc __update_bi。
 """

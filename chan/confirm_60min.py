@@ -3,18 +3,17 @@
 
 管线: 日线信号 → 加载60min数据 → 60min笔/中枢 → 次级别确认
 
-⚠️ 算法文档: /root/data/backtest/ALGORITHM.md (第3.2节)
+⚠️ 算法文档: 仓库根 ALGORITHM.md (第3.2节)
    修改影响算法时必须同步更新 ALGORITHM.md。
 """
 
 import sqlite3
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict
+from chan.paths import DB_PATH
 from chan.bars import RawBar, macd, macd_area
 from chan.bi import build_bi
 from chan.zhongshu import build_zs
-
-DB_PATH = '/root/data/backtest/kline.db'
 
 # 60min 数据缓存 (per session)
 _60MIN_CACHE: Dict[str, List[RawBar]] = {}

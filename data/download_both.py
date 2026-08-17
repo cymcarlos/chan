@@ -8,14 +8,18 @@
 """
 import sqlite3, time, sys, os, json
 
+# 路径自动推导: 仓库根 = data/ 的父目录 (可用 CHAN_DATA_DIR / CHAN_DB_PATH 覆盖)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from chan.paths import DB_PATH, data_file
+
 try:
     import baostock as bs
 except ImportError:
     os.system("pip install baostock --break-system-packages -q")
     import baostock as bs
 
-DB = '/root/data/backtest/kline.db'
-PROG = '/root/data/backtest/dl_both_progress.json'
+DB = DB_PATH
+PROG = data_file('dl_both_progress.json')
 DELAY = 2.5
 RELOGIN_EVERY = 40
 BATCH_PAUSE = 50

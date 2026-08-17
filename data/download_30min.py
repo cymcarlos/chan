@@ -5,13 +5,17 @@
 """
 import sqlite3, time, sys, os
 
+# 路径自动推导: 仓库根 = data/ 的父目录 (可用 CHAN_DATA_DIR / CHAN_DB_PATH 覆盖)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from chan.paths import DB_PATH
+
 try:
     import baostock as bs
 except ImportError:
     os.system("pip install baostock --break-system-packages -q")
     import baostock as bs
 
-DB = '/root/data/backtest/kline.db'
+DB = DB_PATH
 DELAY = 2.5
 
 # 22 只测试股中缺 30min 的 17 只

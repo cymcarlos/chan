@@ -4,9 +4,10 @@
 用法: python3 gen_30min_chart.py <结果json> [--out out.html]
 """
 import sys, os, json, sqlite3
-sys.path.insert(0, '/root/data/backtest')
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from datetime import datetime, timedelta
 
+from chan.paths import DB_PATH, PROJECT_ROOT
 from chan.bars import RawBar, macd
 from chan.bi import build_bi
 from chan.zhongshu import build_zs
@@ -14,9 +15,8 @@ from chan.state import clear_all, clear_level
 from chan.daily_scan import load_daily, scan_daily
 import backtest_daily_30min as b30
 
-DB_PATH = '/root/data/backtest/kline.db'
-OUT_HTML = '/root/data/backtest/charts/bt_daily30_2026_500.html'
-ECHARTS_JS = '/root/data/backtest/charts/echarts.min.js'
+OUT_HTML = os.path.join(PROJECT_ROOT, 'charts', 'bt_daily30_2026_500.html')
+ECHARTS_JS = os.path.join(PROJECT_ROOT, 'charts', 'echarts.min.js')
 D_PLOT_START = '2025-06-01'   # 日K图起点(留结构)
 M_PLOT_START = '2026-01-01'   # 30min图起点(介入段)
 
@@ -137,7 +137,7 @@ def main():
             i += 2
         else:
             rest.append(argv[i]); i += 1
-    res_path = rest[0] if rest else '/root/data/backtest/results/bt_daily30_2026_500.json'
+    res_path = rest[0] if rest else os.path.join(PROJECT_ROOT, 'results', 'bt_daily30_2026_500.json')
     results = json.load(open(res_path))
     trades_by_sym = {}
     for bt, ts in results.items():

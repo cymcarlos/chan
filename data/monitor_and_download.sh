@@ -1,6 +1,8 @@
 #!/bin/bash
-# 监控Baostock IP解封, 解封后自动启动60min下载
+# 监控Baostock IP解封, 解封后自动启动30min下载
 # 每30分钟检查一次
+# 路径基于脚本位置自动推导: data/ 的父目录 = 仓库根
+BASE=$(cd "$(dirname "$0")/.." && pwd)
 
 LOG="/tmp/dl60_monitor.log"
 
@@ -16,7 +18,7 @@ bs.logout()
 
     if [ "$result" = "0" ]; then
         echo "[$(date)] IP已解封! 启动下载..." | tee -a $LOG
-        nohup python3 -u /root/data/backtest/download_60min.py > /tmp/dl60_v6_stdout.log 2>&1 &
+        nohup python3 -u $BASE/data/download_30min.py > /tmp/dl60_v6_stdout.log 2>&1 &
         echo "   PID: $!" | tee -a $LOG
         exit 0
     else

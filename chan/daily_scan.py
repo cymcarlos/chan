@@ -18,13 +18,12 @@ import json
 import sqlite3
 from datetime import datetime
 
+from chan.paths import DB_PATH
 from chan.bars import RawBar, macd, macd_area
 from chan.bi import build_bi
 from chan.zhongshu import build_zs
 from chan.state import clear_level
 from chan.scanner_60min import BuyCandidate, _add_weeks
-
-DB_PATH = '/root/data/backtest/kline.db'
 
 _DAILY_CACHE = {}
 

@@ -2,19 +2,18 @@
 """60分钟纯净管线 — L2中枢 → 买点 → 60min bar walk。
 入场条件: (1)价格近关键位 (2)底分型在近期低点 (3)价格在回升
 
-⚠️ 算法文档: /root/data/backtest/ALGORITHM.md (第3.3节 + 参数表)
+⚠️ 算法文档: 仓库根 ALGORITHM.md (第3.3节 + 参数表)
    修改影响算法时必须同步更新 ALGORITHM.md。
 """
 
 import sqlite3, time
 from datetime import datetime, timedelta
 from collections import defaultdict
+from chan.paths import DB_PATH
 from chan.bars import macd
 from chan.scanner_60min import scan_60min
 from chan.confirm_60min import load_60min
 from chan.state import clear_all
-
-DB_PATH = '/root/data/backtest/kline.db'
 
 # 信号有效期: 104周→52周(一年), 太久的不算
 SIGNAL_WINDOW_WEEKS = 13  # 监控模式: 3个月内不进A区则信号过期

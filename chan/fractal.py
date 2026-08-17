@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """分型检测 — 包含处理 + 顶底分型。Ch62-65。对照 CZSC analyze.py。
 
-⚠️ 算法文档: /root/data/backtest/ALGORITHM.md (第2.2节)
+⚠️ 算法文档: 仓库根 ALGORITHM.md (第2.2节)
    修改影响算法时必须同步更新 ALGORITHM.md。
 """
 

@@ -10,6 +10,10 @@ import sqlite3, time, sys, os, json
 import socket
 socket.setdefaulttimeout(30)  # socket级超时(单次recv)
 
+# 路径自动推导: 仓库根 = data/ 的父目录 (可用 CHAN_DATA_DIR / CHAN_DB_PATH 覆盖)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from chan.paths import DB_PATH, data_file
+
 # 请求级硬墙钟(2026-08-12, 审查发现): baostock send_msg是 while True: recv(8192) 循环,
 # 服务端慢速吐数据时30s超时被逐次重置 → 单请求可挂~170s(日志实测09:54→10:11六请求17分钟)
 # signal.alarm 60s 到点强抛, 防单请求无界挂起
@@ -29,8 +33,8 @@ except ImportError:
     os.system("pip install baostock --break-system-packages -q")
     import baostock as bs
 
-DB = '/root/data/backtest/kline.db'
-PROG = '/root/data/backtest/dl_d30_progress.json'
+DB = DB_PATH
+PROG = data_file('dl_d30_progress.json')
 DELAY = 2.5
 RELOGIN_EVERY = 40
 BATCH_PAUSE = 50

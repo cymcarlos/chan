@@ -4,7 +4,7 @@
 中枢 = 至少三个连续次级别(笔)走势重叠的部分。
 ZG = min(重叠段高点的最小值) / ZD = max(重叠段低点的最大值)
 
-⚠️ 算法文档: /root/data/backtest/ALGORITHM.md (第2.4节)
+⚠️ 算法文档: 仓库根 ALGORITHM.md (第2.4节)
    修改影响算法时必须同步更新 ALGORITHM.md。
 """
 
